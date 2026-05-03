@@ -1,0 +1,13 @@
+[project]
+name = "personal-assistant"
+version = "0.1.0"
+description = "Local-first agentic personal assistant running on CPU"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.136.1",
+    "ollama>=0.6.2",
+    "pydantic>=2.13.3",
+    "pydantic-settings>=2.14.0",
+    "uvicorn[standard]>=0.46.0",
+]
