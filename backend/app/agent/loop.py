@@ -39,7 +39,6 @@ async def _dispatch_tool(
     args: dict[str, Any],
     *,
     call_id: str,
-    on_event: OnEvent,
     request_approval: RequestApproval,
 ) -> tuple[bool, str]:
     """Execute one tool call. Returns (ok, result_text).
@@ -95,16 +94,35 @@ async def run_turn(
 
     for step in range(settings.agent_max_steps):
         log.info("agent cid=%s step=%d", conversation_id, step)
-        resp = await client.chat(
+        # Stream every iteration. Content deltas are forwarded to the UI as
+        # token frames as they arrive; tool_calls (when present) come in a
+        # late chunk and only matter once the stream finishes. Probed against
+        # qwen3.5:4b — see docs/learnings/streaming-with-tools.md.
+        stream = await client.chat(
             model=settings.ollama_model,
             messages=msgs,
             tools=tool_specs,
-            stream=False,
+            stream=True,
             think=settings.ollama_think,
         )
-        assistant = resp.message  # ollama-python Message (pydantic)
-        tool_calls = assistant.tool_calls or []
-        content = assistant.content or ""
+
+        content_chunks: list[str] = []
+        final_tool_calls: list = []
+        async for chunk in stream:
+            msg = chunk.message
+            if msg.content:
+                content_chunks.append(msg.content)
+                await on_event(
+                    {"type": "token", "delta": msg.content}
+                )
+            if msg.tool_calls:
+                # Probe shows tool_calls arrive complete in one chunk. If a
+                # future Ollama version splits them, the last one wins — we
+                # can revisit when that bites.
+                final_tool_calls = list(msg.tool_calls)
+
+        content = "".join(content_chunks)
+        tool_calls = final_tool_calls
 
         if not tool_calls:
             log.info(
@@ -115,9 +133,16 @@ async def run_turn(
             )
             return content
 
-        # Append the assistant turn (with tool_calls) as a dict so subsequent
-        # iterations send a consistent transcript back to Ollama.
-        msgs.append(assistant.model_dump(exclude_none=True))
+        # Append the assistant turn (with tool_calls) so the next iteration
+        # sees a consistent transcript. Build the dict explicitly because we
+        # don't have a single Message object after streaming.
+        msgs.append(
+            {
+                "role": "assistant",
+                "content": content,
+                "tool_calls": [tc.model_dump() for tc in tool_calls],
+            }
+        )
 
         for tc in tool_calls:
             name = tc.function.name
@@ -137,7 +162,6 @@ async def run_turn(
                 name,
                 args,
                 call_id=call_id,
-                on_event=on_event,
                 request_approval=request_approval,
             )
 

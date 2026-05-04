@@ -179,16 +179,7 @@ async def chat_stream(ws: WebSocket) -> None:
                     request_approval=request_approval,
                 )
                 _persist_turn(req.conversation_id, req.message, final)
-                # Non-streaming MVP: ship the final text as a single token frame
-                # so the UI's existing assistant-message reducer renders it
-                # without needing a new frame type. ADR 0003 §1 calls this out.
-                await ws.send_json(
-                    {
-                        "type": "token",
-                        "delta": final,
-                        "conversation_id": req.conversation_id,
-                    }
-                )
+                # The loop streamed token frames as they arrived; just close.
                 await ws.send_json(
                     {"type": "done", "conversation_id": req.conversation_id}
                 )

@@ -31,6 +31,7 @@ Source of truth for the high-level design: [Project-Idea.md](Project-Idea.md). P
 | Agent loop | Hand-built JSON tool-call protocol — **no framework** (no smolagents, LangChain, LangGraph) | [0001](docs/decisions/0001-tech-stack.md) |
 | Chat transport | Long-lived WebSocket, multi-turn, typed JSON frames | [0002](docs/decisions/0002-chat-transport.md) |
 | Agent loop shape | Native Ollama tool-calling, sequential ReAct, sandboxed tools | [0003](docs/decisions/0003-agent-loop.md) |
+| Streaming + tools | Stream every iteration; tool_calls finalize on the last chunk | [0004](docs/decisions/0004-streaming-with-tools.md) |
 | Package manager | uv | [0001](docs/decisions/0001-tech-stack.md) |
 | Python | 3.12 | [0001](docs/decisions/0001-tech-stack.md) |
 
@@ -60,13 +61,14 @@ The agent's prompt builder (Phase 1+) reads `SOUL.md` at request time, so person
 
 ## Documentation discipline
 
-The user has asked us to keep the project documented as we build. Three folders, each with its own README:
+The user has asked us to keep the project documented as we build. Four folders, each with its own README:
 
 - [docs/sessions/](docs/sessions/) — one file per working session, `YYYY-MM-DD-short-slug.md`. Records what we did, what we decided, and what's left.
 - [docs/decisions/](docs/decisions/) — ADRs for significant design choices. Numbered, immutable.
+- [docs/design/](docs/design/) — living HLD + LLD with Mermaid diagrams. The synthesised architectural view; cross-references ADRs for the *why*. Refresh after sessions that add or remove a component.
 - [docs/learnings/](docs/learnings/) — topic-based notes on what we learned (especially the dead ends).
 
-**Every session should end with a session log entry.** Update CLAUDE.md's decisions table whenever a new ADR is written.
+**Every session should end with a session log entry.** Update CLAUDE.md's decisions table whenever a new ADR is written. Update the relevant section of [docs/design/](docs/design/) whenever a session changes a component's shape (not for in-component edits).
 
 ## Repo layout
 
@@ -96,9 +98,10 @@ personal_assistant/
 │   ├── smoke_chat_ws_proxy.py  # WS streaming via Vite dev proxy
 │   └── smoke_agent.py          # drive the agent loop through tool calls + approval
 ├── docs/
+│   ├── decisions/              # ADRs (immutable)
+│   ├── design/                 # HLD + LLD (living, with Mermaid)
 │   ├── learnings/
-│   ├── sessions/
-│   └── decisions/
+│   └── sessions/
 ├── main.py                     # CLI entry placeholder
 ├── pyproject.toml              # uv-managed deps
 ├── .env.example

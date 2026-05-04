@@ -1,6 +1,6 @@
 # 0003 — Agent loop: native tool-calling, sequential ReAct, sandboxed tools
 
-**Status:** Accepted
+**Status:** Accepted (§1's streaming sub-decision superseded by [ADR 0004](0004-streaming-with-tools.md))
 **Date:** 2026-05-03
 **Phase:** 2
 
