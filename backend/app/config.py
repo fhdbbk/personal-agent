@@ -32,3 +32,13 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def device_options() -> dict | None:
+    """Translate PA_OLLAMA_DEVICE into an Ollama `options` dict, or None for auto."""
+    device = get_settings().ollama_device
+    if device == "cpu":
+        return {"num_gpu": 0}
+    if device == "gpu":
+        return {"num_gpu": 999}  # ollama clamps to the model's actual layer count
+    return None
