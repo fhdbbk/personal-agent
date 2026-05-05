@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from backend.app.agent.loop import AgentError, run_turn
 from backend.app.agent.prompt import system_prompt
-from backend.app.config import get_settings
+from backend.app.config import device_options, get_settings
 from backend.app.memory.buffer import Message, buffer
 
 router = APIRouter()
@@ -56,27 +56,13 @@ def _persist_turn(conversation_id: str, user_text: str, reply: str) -> None:
     buffer.append(conversation_id, Message(role="assistant", content=reply))
 
 
-def _device_options() -> dict | None:
-    """Translate PA_OLLAMA_DEVICE into an Ollama `options` dict.
-
-    Returns None when no override is needed (auto), otherwise a dict that
-    pins `num_gpu` to force CPU-only or full-GPU offload.
-    """
-    device = get_settings().ollama_device
-    if device == "cpu":
-        return {"num_gpu": 0}
-    if device == "gpu":
-        return {"num_gpu": 999}  # ollama clamps to the model's actual layer count
-    return None
-
-
 @router.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest) -> ChatResponse:
     settings = get_settings()
     log.info("chat cid=%s msg_len=%d", req.conversation_id, len(req.message))
     t0 = time.perf_counter()
     msgs = _build_messages(req.conversation_id, req.message)
-    options = _device_options()
+    options = device_options()
     extra = {"options": options} if options else {}
     try:
         resp = await _client().chat(

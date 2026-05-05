@@ -153,17 +153,15 @@ classDiagram
 
 Two tiny helpers used by both the HTTP and WS handlers. [`_build_messages`](../../backend/app/api/chat.py#L46) prepends `{"role":"system", "content": system_prompt()}` (re-read fresh — see [§9](#9-prompt-assembly)), spreads the history out as `{role, content}` dicts, and appends the new user turn. [`_persist_turn`](../../backend/app/api/chat.py#L54) appends the user message *and* the assistant reply to the buffer in one go.
 
-### `_device_options()`
+### `device_options()`
 
-Translates `PA_OLLAMA_DEVICE` into an Ollama `options` dict ([chat.py:59](../../backend/app/api/chat.py#L59)):
+Lives in [config.py](../../backend/app/config.py) and is shared by both the `POST /chat` handler and the agent loop. Translates `PA_OLLAMA_DEVICE` into an Ollama `options` dict:
 
 | `PA_OLLAMA_DEVICE` | Returns | Effect |
 |---|---|---|
 | `auto` (default) | `None` | Ollama decides |
 | `cpu` | `{"num_gpu": 0}` | Force CPU-only |
 | `gpu` | `{"num_gpu": 999}` | Full offload (Ollama clamps to actual layer count) |
-
-Currently used **only by `POST /chat`**. The agent loop streaming call doesn't pass `options` — see ADR [0004](../decisions/0004-streaming-with-tools.md) and [§5 below](#5-agent-loop).
 
 ### WebSocket connection state
 
@@ -318,20 +316,20 @@ sequenceDiagram
     autonumber
     participant UI as Browser UI
     participant API as WS handler
-    participant Loop as run_turn()
+    participant RunTurn as run_turn()
     participant Ollama
     participant Buf as buffer
 
     UI->>API: {cid, message}
-    API->>Loop: run_turn(base_msgs, on_event, request_approval)
-    Loop->>Ollama: chat(stream=True, tools=[...])
+    API->>RunTurn: run_turn(base_msgs, on_event, request_approval)
+    RunTurn->>Ollama: chat(stream=True, tools=[...])
     loop streaming
-        Ollama-->>Loop: chunk(content)
-        Loop->>API: on_event({type:"token", delta})
+        Ollama-->>RunTurn: chunk(content)
+        RunTurn->>API: on_event({type:"token", delta})
         API-->>UI: token frame
     end
-    Ollama-->>Loop: chunk(done, no tool_calls)
-    Loop-->>API: return content
+    Ollama-->>RunTurn: chunk(done, no tool_calls)
+    RunTurn-->>API: return content
     API->>Buf: append(user, assistant)
     API-->>UI: {type:"done", cid}
 ```
@@ -343,19 +341,19 @@ sequenceDiagram
     autonumber
     participant UI as Browser UI
     participant API as WS handler
-    participant Loop as run_turn()
+    participant RunTurn as run_turn()
     participant Disp as _dispatch_tool()
     participant Tool as write_file()
     participant Ollama
 
     UI->>API: {cid, "save a note"}
-    API->>Loop: run_turn(...)
-    Loop->>Ollama: chat(stream=True, tools=[...])
-    Ollama-->>Loop: stream<br/>(some content)<br/>+ tool_calls=[write_file{...}]
-    Loop->>API: on_event(token...) (during stream)
-    Loop->>API: on_event({tool_call, call_id, name, args})
+    API->>RunTurn: run_turn(...)
+    RunTurn->>Ollama: chat(stream=True, tools=[...])
+    Ollama-->>RunTurn: stream<br/>(some content)<br/>+ tool_calls=[write_file{...}]
+    RunTurn->>API: on_event(token...) (during stream)
+    RunTurn->>API: on_event({tool_call, call_id, name, args})
     API-->>UI: tool_call frame
-    Loop->>Disp: _dispatch_tool(write_file, args)
+    RunTurn->>Disp: _dispatch_tool(write_file, args)
     Disp->>API: request_approval(call_id, name, args)
     API-->>UI: tool_approval frame
     Note over UI: user clicks Approve
@@ -363,18 +361,18 @@ sequenceDiagram
     API-->>Disp: True
     Disp->>Tool: await write_file(**args)
     Tool-->>Disp: "wrote 12 chars to note.md"
-    Disp-->>Loop: (ok=True, "wrote ...")
-    Loop->>API: on_event({tool_result, call_id, ok, preview})
+    Disp-->>RunTurn: (ok=True, "wrote ...")
+    RunTurn->>API: on_event({tool_result, call_id, ok, preview})
     API-->>UI: tool_result frame
-    Note over Loop: append {"role":"tool", content:full}<br/>loop again
-    Loop->>Ollama: chat(stream=True, tools=[...])
+    Note over RunTurn: append {"role":"tool", content:full}<br/>loop again
+    RunTurn->>Ollama: chat(stream=True, tools=[...])
     loop streaming
-        Ollama-->>Loop: chunk(content)
-        Loop->>API: on_event(token)
+        Ollama-->>RunTurn: chunk(content)
+        RunTurn->>API: on_event(token)
         API-->>UI: token frame
     end
-    Ollama-->>Loop: chunk(done, no tool_calls)
-    Loop-->>API: return content
+    Ollama-->>RunTurn: chunk(done, no tool_calls)
+    RunTurn-->>API: return content
     API-->>UI: {type:"done", cid}
 ```
 
@@ -383,29 +381,29 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Loop as run_turn()
+    participant RunTurn as run_turn()
     participant Disp as _dispatch_tool()
     participant Tool as read_file()
     participant Ollama
 
-    Note over Loop: consecutive_errors=0
-    Loop->>Disp: read_file(path="missing.txt")
+    Note over RunTurn: consecutive_errors=0
+    RunTurn->>Disp: read_file(path="missing.txt")
     Disp->>Tool: await read_file(...)
     Tool--xDisp: FileNotFoundError
-    Disp-->>Loop: (False, "FileNotFoundError: no such file: missing.txt")
-    Note over Loop: counter → 1<br/>(MAX_RETRIES=2, allowed)
-    Loop->>Ollama: chat(...)<br/>(model sees error)
-    Ollama-->>Loop: tool_calls=[read_file(path="still-missing.txt")]
-    Loop->>Disp: read_file(...)
+    Disp-->>RunTurn: (False, "FileNotFoundError: no such file: missing.txt")
+    Note over RunTurn: counter → 1<br/>(MAX_RETRIES=2, allowed)
+    RunTurn->>Ollama: chat(...)<br/>(model sees error)
+    Ollama-->>RunTurn: tool_calls=[read_file(path="still-missing.txt")]
+    RunTurn->>Disp: read_file(...)
     Tool--xDisp: FileNotFoundError
-    Disp-->>Loop: (False, "...")
-    Note over Loop: counter → 2 (still allowed)
-    Loop->>Ollama: chat(...)
-    Ollama-->>Loop: tool_calls=[read_file(path="nope.txt")]
-    Loop->>Disp: read_file(...)
-    Disp-->>Loop: (False, "...")
-    Note over Loop: counter → 3 > MAX_RETRIES_PER_TOOL=2
-    Loop--xLoop: raise AgentError("tool 'read_file' failed 3 times in a row...")
+    Disp-->>RunTurn: (False, "...")
+    Note over RunTurn: counter → 2 (still allowed)
+    RunTurn->>Ollama: chat(...)
+    Ollama-->>RunTurn: tool_calls=[read_file(path="nope.txt")]
+    RunTurn->>Disp: read_file(...)
+    Disp-->>RunTurn: (False, "...")
+    Note over RunTurn: counter → 3 > MAX_RETRIES_PER_TOOL=2
+    RunTurn--xRunTurn: raise AgentError("tool 'read_file' failed 3 times in a row...")
 ```
 
 **(d) Approval denied — not counted as an error**
@@ -413,14 +411,14 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant UI as Browser UI
-    participant Loop as run_turn()
+    participant RunTurn as run_turn()
     participant Disp as _dispatch_tool()
 
-    Loop->>Disp: write_file(...)
+    RunTurn->>Disp: write_file(...)
     Disp->>UI: request_approval (via WS)
     UI-->>Disp: approved=false
-    Disp-->>Loop: (ok=True, "User denied this action.")
-    Note over Loop: counter unchanged.<br/>append {"role":"tool", "User denied..."}<br/>loop again — model sees the denial<br/>and decides what to do
+    Disp-->>RunTurn: (ok=True, "User denied this action.")
+    Note over RunTurn: counter unchanged.<br/>append {"role":"tool", "User denied..."}<br/>loop again — model sees the denial<br/>and decides what to do
 ```
 
 ---
@@ -589,7 +587,7 @@ The cost is one small file read per turn (negligible). The benefit is rapid iter
 | `ollama_host` | `PA_OLLAMA_HOST` | `http://localhost:11434` | `chat._client()`, `/health` |
 | `ollama_model` | `PA_OLLAMA_MODEL` | `qwen3.5:4b` | `chat`, `loop` |
 | `ollama_think` | `PA_OLLAMA_THINK` | `false` | `chat`, `loop` (Qwen3's reasoning mode) |
-| `ollama_device` | `PA_OLLAMA_DEVICE` | `auto` | `chat._device_options()` only — not the loop today |
+| `ollama_device` | `PA_OLLAMA_DEVICE` | `auto` | `config.device_options()` — used by both `POST /chat` and the agent loop |
 | `request_timeout_s` | `PA_REQUEST_TIMEOUT_S` | `60.0` | Per-chunk idle timeout for streaming Ollama calls |
 | `agent_sandbox` | `PA_AGENT_SANDBOX` | `sandbox` | `_sandbox.sandbox_root()` |
 | `agent_max_steps` | `PA_AGENT_MAX_STEPS` | `8` | `loop.run_turn()` |
@@ -761,7 +759,7 @@ sequenceDiagram
     participant Retr as Retriever
     participant Embed as Embedder
     participant Store as LongTermStore
-    participant Loop as run_turn()
+    participant RunTurn as run_turn()
 
     API->>Retr: recall(user_message, k=5)
     Retr->>Embed: embed(user_message)
@@ -770,7 +768,7 @@ sequenceDiagram
     Store-->>Retr: list[Fact]
     Retr-->>API: list[Fact]
     Note over API: build msgs = [<br/>  system: SOUL + "Things you remember:" + facts,<br/>  ...history...,<br/>  user_message<br/>]
-    API->>Loop: run_turn(base_msgs, ...)
+    API->>RunTurn: run_turn(base_msgs, ...)
 ```
 
 ### Fact extraction
