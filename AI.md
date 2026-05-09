@@ -32,6 +32,7 @@ Source of truth for the high-level design: [Project-Idea.md](Project-Idea.md). P
 | Chat transport | Long-lived WebSocket, multi-turn, typed JSON frames | [0002](docs/decisions/0002-chat-transport.md) |
 | Agent loop shape | Native Ollama tool-calling, sequential ReAct, sandboxed tools | [0003](docs/decisions/0003-agent-loop.md) |
 | Streaming + tools | Stream every iteration; tool_calls finalize on the last chunk | [0004](docs/decisions/0004-streaming-with-tools.md) |
+| `web_search` backend | `ddgs` library (browser-fingerprinted DDG) — raw HTML scrape was bot-blocked | [0005](docs/decisions/0005-search-backend-ddgs.md) |
 | Package manager | uv | [0001](docs/decisions/0001-tech-stack.md) |
 | Python | 3.12 | [0001](docs/decisions/0001-tech-stack.md) |
 
@@ -84,7 +85,8 @@ personal_assistant/
 │       │   ├── registry.py     # Tool dataclass + TOOLS dict + ollama specs
 │       │   ├── _sandbox.py     # safe_path / sandbox_root for file tools
 │       │   ├── read_file.py    # read_file tool + JSON schema
-│       │   └── write_file.py   # write_file tool + JSON schema (approval-gated)
+│       │   ├── write_file.py   # write_file tool + JSON schema (approval-gated)
+│       │   └── web_search.py   # web_search tool — DDG via ddgs library (ADR 0005)
 │       ├── memory/buffer.py    # in-process conversation ring buffer
 │       ├── main.py             # FastAPI entry, /health, router mount, CORS
 │       └── config.py           # pydantic-settings, PA_* env vars
@@ -96,7 +98,9 @@ personal_assistant/
 │   ├── smoke_ollama.py         # verify Ollama reachable + model can complete
 │   ├── smoke_chat_ws.py        # direct WS streaming smoke test
 │   ├── smoke_chat_ws_proxy.py  # WS streaming via Vite dev proxy
-│   └── smoke_agent.py          # drive the agent loop through tool calls + approval
+│   ├── smoke_agent.py          # drive the agent loop through tool calls + approval
+│   ├── smoke_web_search.py     # direct ddgs probe (no agent, no LLM)
+│   └── smoke_agent_web_search.py # end-to-end: agent uses web_search
 ├── docs/
 │   ├── decisions/              # ADRs (immutable)
 │   ├── design/                 # HLD + LLD (living, with Mermaid)
@@ -110,7 +114,7 @@ personal_assistant/
 └── CLAUDE.md
 ```
 
-Future phases will add `backend/app/audio/` for voice I/O, plus `web_search` and `python_exec` tools.
+Future phases will add `backend/app/audio/` for voice I/O, plus the sandboxed `python_exec` tool.
 
 ## Commands
 
@@ -136,6 +140,10 @@ uv run python scripts/smoke_chat_ws_proxy.py
 
 # Smoke-test the agent loop (read_file + write_file with approval)
 uv run python scripts/smoke_agent.py
+
+# Smoke-test web_search directly (no agent, no LLM) and through the agent
+uv run python scripts/smoke_web_search.py
+uv run python scripts/smoke_agent_web_search.py
 
 # Add a dependency
 uv add <package>

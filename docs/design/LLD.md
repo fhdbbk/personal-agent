@@ -36,6 +36,7 @@ flowchart TB
         registry["tools/registry.py<br/>Tool, TOOLS, ollama_tool_specs()"]
         readf["tools/read_file.py"]
         writef["tools/write_file.py"]
+        websearch["tools/web_search.py<br/>(ddgs)"]
         sandbox["tools/_sandbox.py<br/>safe_path()"]
         buffer["memory/buffer.py<br/>ConversationBuffer"]
         cfg["config.py<br/>Settings, get_settings()"]
@@ -52,6 +53,7 @@ flowchart TB
         loop --> cfg
         registry --> readf
         registry --> writef
+        registry --> websearch
         readf --> sandbox
         writef --> sandbox
         sandbox --> cfg
@@ -63,6 +65,7 @@ flowchart TB
 
     proc <-->|WS + HTTP| browser(["Browser"])
     proc -->|httpx async| ollama(["Ollama daemon"])
+    websearch -->|primp HTTP| ddg(["DuckDuckGo"])
 ```
 
 The whole backend is a single uvicorn process. All singletons (`get_settings()`, `_client()`, `buffer`) live for the process lifetime.
@@ -455,11 +458,19 @@ classDiagram
         schema = WRITE_FILE_SCHEMA
         requires_approval = true
     }
+    class web_search_tool {
+        name = "web_search"
+        fn = web_search
+        schema = WEB_SEARCH_SCHEMA
+        requires_approval = false
+    }
 
     TOOLS --> read_file_tool
     TOOLS --> write_file_tool
+    TOOLS --> web_search_tool
     read_file_tool --|> Tool
     write_file_tool --|> Tool
+    web_search_tool --|> Tool
 ```
 
 `ollama_tool_specs()` ([registry.py:45](../../backend/app/tools/registry.py#L45)) is the single export the loop needs — a list of the `schema` dicts ready to pass to `client.chat(tools=...)`.
@@ -478,7 +489,7 @@ That's it. The loop picks it up via `ollama_tool_specs()` on the next turn.
 
 ## 7. Tools and sandbox
 
-**Files**: [tools/read_file.py](../../backend/app/tools/read_file.py), [tools/write_file.py](../../backend/app/tools/write_file.py), [tools/_sandbox.py](../../backend/app/tools/_sandbox.py)
+**Files**: [tools/read_file.py](../../backend/app/tools/read_file.py), [tools/write_file.py](../../backend/app/tools/write_file.py), [tools/web_search.py](../../backend/app/tools/web_search.py), [tools/_sandbox.py](../../backend/app/tools/_sandbox.py)
 
 ### `read_file` ([read_file.py](../../backend/app/tools/read_file.py))
 
@@ -501,6 +512,18 @@ That's it. The loop picks it up via `ollama_tool_specs()` on the next turn.
 | Behaviour | Creates parent directories; **overwrites** existing files |
 | Errors | `SandboxError`; `OSError` from the underlying write |
 | Async | Writes via `asyncio.to_thread(p.write_text, content, "utf-8")` |
+
+### `web_search` ([web_search.py](../../backend/app/tools/web_search.py))
+
+| Aspect | Value |
+|---|---|
+| Schema params | `{"query": str}`, required |
+| Approval | No (read-only) |
+| Returns | Numbered list (1..5) of `title / url / snippet` blocks, prefixed with `"Search results for '<query>':"` |
+| Backend | `ddgs` library — DDG via [`primp`](https://pypi.org/project/primp/), a Rust HTTP client with browser-grade TLS fingerprinting. See [ADR 0005](../decisions/0005-search-backend-ddgs.md) for why we don't scrape the HTML endpoint directly |
+| Result count | Fixed at `MAX_RESULTS = 5` — not exposed to the model |
+| Errors | Library exceptions surface as `(ok=False, …)` to the loop; common case is empty results, which return `"No results for '<query>'."` (still `ok=True`) |
+| Async | `ddgs.text` is sync; we wrap in `asyncio.to_thread` so the event loop keeps moving |
 
 ### `_sandbox.safe_path()` ([_sandbox.py:23](../../backend/app/tools/_sandbox.py#L23))
 
@@ -876,9 +899,10 @@ The decision affects whether the backend remains "always-on at home, phone talks
 | [backend/app/api/chat.py](../../backend/app/api/chat.py) | ~215 | HTTP + WS endpoints, frame protocol |
 | [backend/app/agent/loop.py](../../backend/app/agent/loop.py) | ~198 | `run_turn()`, `_dispatch_tool()` |
 | [backend/app/agent/prompt.py](../../backend/app/agent/prompt.py) | ~10 | `system_prompt()` (SOUL.md hot-loader) |
-| [backend/app/tools/registry.py](../../backend/app/tools/registry.py) | ~48 | `Tool`, `TOOLS`, `ollama_tool_specs()` |
+| [backend/app/tools/registry.py](../../backend/app/tools/registry.py) | ~54 | `Tool`, `TOOLS`, `ollama_tool_specs()` |
 | [backend/app/tools/read_file.py](../../backend/app/tools/read_file.py) | ~43 | read tool + schema |
 | [backend/app/tools/write_file.py](../../backend/app/tools/write_file.py) | ~38 | write tool + schema |
+| [backend/app/tools/web_search.py](../../backend/app/tools/web_search.py) | ~70 | DDG search via `ddgs` library + schema |
 | [backend/app/tools/_sandbox.py](../../backend/app/tools/_sandbox.py) | ~37 | `safe_path()`, `sandbox_root()`, `SandboxError` |
 | [backend/app/memory/buffer.py](../../backend/app/memory/buffer.py) | ~41 | `Message`, `ConversationBuffer`, `buffer` singleton |
 | [backend/app/config.py](../../backend/app/config.py) | ~35 | `Settings`, `get_settings()` |

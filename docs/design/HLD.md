@@ -205,9 +205,9 @@ flowchart LR
 
 ADR [0002](../decisions/0002-chat-transport.md) shipped here (WebSocket + JSON frame protocol).
 
-### Phase 2 — Agent loop + tools · ✅ **Done** (file tools); 🔄 **In progress** (web_search, python_exec)
+### Phase 2 — Agent loop + tools · ✅ **Done** (file tools, web_search); 🔄 **In progress** (python_exec)
 
-Sequential ReAct loop, `read_file`, `write_file`, sandbox, approval flow, streaming on every iteration. The frame protocol gains `tool_call`, `tool_result`, `tool_approval`, and `approval_response`. ADRs [0003](../decisions/0003-agent-loop.md) and [0004](../decisions/0004-streaming-with-tools.md) shipped here.
+Sequential ReAct loop, `read_file`, `write_file`, `web_search`, sandbox, approval flow, streaming on every iteration. The frame protocol gains `tool_call`, `tool_result`, `tool_approval`, and `approval_response`. ADRs [0003](../decisions/0003-agent-loop.md), [0004](../decisions/0004-streaming-with-tools.md), and [0005](../decisions/0005-search-backend-ddgs.md) shipped here.
 
 ```mermaid
 flowchart LR
@@ -216,10 +216,11 @@ flowchart LR
     loop --> reg["tool registry"]
     reg --> rf["read_file"]
     reg --> wf["write_file"]
-    reg -. planned .-> ws["web_search"]
+    reg --> ws["web_search<br/>(ddgs)"]
     reg -. planned .-> py["python_exec<br/>(subprocess + rlimits)"]
     rf --> sb[("sandbox/")]
     wf --> sb
+    ws --> ddg["DuckDuckGo<br/>(via primp)"]
     loop --> ollama
 ```
 
@@ -329,7 +330,7 @@ personal_assistant/
 ├── backend/app/
 │   ├── api/chat.py                # HTTP + WebSocket
 │   ├── agent/{loop,prompt}.py     # ReAct loop + SOUL.md loader
-│   ├── tools/                     # registry + read_file / write_file + _sandbox
+│   ├── tools/                     # registry + read_file / write_file / web_search + _sandbox
 │   ├── memory/buffer.py           # in-process ring buffer
 │   ├── config.py                  # pydantic-settings
 │   ├── logging_config.py          # rotating file logger

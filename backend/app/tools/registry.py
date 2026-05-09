@@ -9,6 +9,8 @@ from typing import Awaitable, Callable
 
 from backend.app.tools.read_file import SCHEMA as READ_FILE_SCHEMA
 from backend.app.tools.read_file import read_file
+from backend.app.tools.web_search import SCHEMA as WEB_SEARCH_SCHEMA
+from backend.app.tools.web_search import web_search
 from backend.app.tools.write_file import SCHEMA as WRITE_FILE_SCHEMA
 from backend.app.tools.write_file import write_file
 
@@ -38,6 +40,12 @@ TOOLS: dict[str, Tool] = {
         fn=write_file,
         schema=WRITE_FILE_SCHEMA,
         requires_approval=True,
+    ),
+    "web_search": Tool(
+        name="web_search",
+        fn=web_search,
+        schema=WEB_SEARCH_SCHEMA,
+        requires_approval=False,
     ),
 }
 

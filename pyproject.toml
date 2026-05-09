@@ -5,6 +5,7 @@ description = "Local-first agentic personal assistant running on CPU"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "ddgs>=9.14.2",
     "fastapi>=0.136.1",
     "ollama>=0.6.2",
     "pydantic>=2.13.3",
