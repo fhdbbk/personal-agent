@@ -13,3 +13,17 @@ dependencies = [
     "trafilatura>=2.0.0",
     "uvicorn[standard]>=0.46.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.3.0",
+]
+
+[tool.pytest.ini_options]
+# Project isn't installed as a package yet (per CLAUDE.md conventions),
+# so let pytest pick up backend.app.* by adding the repo root to sys.path.
+pythonpath = ["."]
+testpaths = ["backend/tests"]
+# Treat every `async def test_*` as an asyncio test without a decorator.
+asyncio_mode = "auto"

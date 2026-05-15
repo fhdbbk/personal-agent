@@ -93,6 +93,8 @@ personal_assistant/
 │       ├── memory/buffer.py    # in-process conversation ring buffer
 │       ├── main.py             # FastAPI entry, /health, router mount, CORS
 │       └── config.py           # pydantic-settings, PA_* env vars
+│   └── tests/                  # pytest suite (unit tests, no live Ollama)
+│       └── test_agent_loop.py  # run_turn behaviour: stats, tools, approval, retries, max-steps
 ├── frontend/                   # Vite + React + TS chat UI
 │   ├── src/App.tsx             # chat + tool transcript + approval buttons
 │   └── vite.config.ts          # dev proxy: /chat (ws) and /health → :8000
@@ -157,7 +159,10 @@ uv run python scripts/smoke_agent_web_search.py
 uv run python scripts/smoke_fetch_url.py
 uv run python scripts/smoke_agent_fetch_url.py
 
-# Add a dependency
+# Run the unit tests (agent loop, no live Ollama needed)
+uv run pytest
+
+# Add a dependency (use --group dev for test-only deps)
 uv add <package>
 ```
 
