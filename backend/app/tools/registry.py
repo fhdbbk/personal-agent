@@ -7,6 +7,10 @@ the callable, the JSON schema we hand to Ollama, and the approval flag.
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
+from backend.app.tools.fetch_url import SCHEMA as FETCH_URL_SCHEMA
+from backend.app.tools.fetch_url import fetch_url
+from backend.app.tools.list_files import SCHEMA as LIST_FILES_SCHEMA
+from backend.app.tools.list_files import list_files
 from backend.app.tools.read_file import SCHEMA as READ_FILE_SCHEMA
 from backend.app.tools.read_file import read_file
 from backend.app.tools.web_search import SCHEMA as WEB_SEARCH_SCHEMA
@@ -29,6 +33,12 @@ class Tool:
 
 
 TOOLS: dict[str, Tool] = {
+    "list_files": Tool(
+        name="list_files",
+        fn=list_files,
+        schema=LIST_FILES_SCHEMA,
+        requires_approval=False,
+    ),
     "read_file": Tool(
         name="read_file",
         fn=read_file,
@@ -46,6 +56,12 @@ TOOLS: dict[str, Tool] = {
         fn=web_search,
         schema=WEB_SEARCH_SCHEMA,
         requires_approval=False,
+    ),
+    "fetch_url": Tool(
+        name="fetch_url",
+        fn=fetch_url,
+        schema=FETCH_URL_SCHEMA,
+        requires_approval=True,
     ),
 }
 

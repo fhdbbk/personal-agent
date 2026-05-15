@@ -10,5 +10,6 @@ dependencies = [
     "ollama>=0.6.2",
     "pydantic>=2.13.3",
     "pydantic-settings>=2.14.0",
+    "trafilatura>=2.0.0",
     "uvicorn[standard]>=0.46.0",
 ]

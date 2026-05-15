@@ -33,6 +33,7 @@ Source of truth for the high-level design: [Project-Idea.md](Project-Idea.md). P
 | Agent loop shape | Native Ollama tool-calling, sequential ReAct, sandboxed tools | [0003](docs/decisions/0003-agent-loop.md) |
 | Streaming + tools | Stream every iteration; tool_calls finalize on the last chunk | [0004](docs/decisions/0004-streaming-with-tools.md) |
 | `web_search` backend | `ddgs` library (browser-fingerprinted DDG) — raw HTML scrape was bot-blocked | [0005](docs/decisions/0005-search-backend-ddgs.md) |
+| `fetch_url` tool | `primp` (reused from ddgs) + `trafilatura` extractor; approval-gated; public hosts only | [0006](docs/decisions/0006-fetch-url-tool.md) |
 | Package manager | uv | [0001](docs/decisions/0001-tech-stack.md) |
 | Python | 3.12 | [0001](docs/decisions/0001-tech-stack.md) |
 
@@ -84,9 +85,11 @@ personal_assistant/
 │       ├── tools/
 │       │   ├── registry.py     # Tool dataclass + TOOLS dict + ollama specs
 │       │   ├── _sandbox.py     # safe_path / sandbox_root for file tools
+│       │   ├── list_files.py   # list_files tool — sandbox dir listing
 │       │   ├── read_file.py    # read_file tool + JSON schema
 │       │   ├── write_file.py   # write_file tool + JSON schema (approval-gated)
-│       │   └── web_search.py   # web_search tool — DDG via ddgs library (ADR 0005)
+│       │   ├── web_search.py   # web_search tool — DDG via ddgs library (ADR 0005)
+│       │   └── fetch_url.py    # fetch_url tool — primp + trafilatura, approval-gated (ADR 0006)
 │       ├── memory/buffer.py    # in-process conversation ring buffer
 │       ├── main.py             # FastAPI entry, /health, router mount, CORS
 │       └── config.py           # pydantic-settings, PA_* env vars
@@ -100,7 +103,9 @@ personal_assistant/
 │   ├── smoke_chat_ws_proxy.py  # WS streaming via Vite dev proxy
 │   ├── smoke_agent.py          # drive the agent loop through tool calls + approval
 │   ├── smoke_web_search.py     # direct ddgs probe (no agent, no LLM)
-│   └── smoke_agent_web_search.py # end-to-end: agent uses web_search
+│   ├── smoke_agent_web_search.py # end-to-end: agent uses web_search
+│   ├── smoke_fetch_url.py      # direct fetch_url probe (no agent, no LLM)
+│   └── smoke_agent_fetch_url.py # end-to-end: agent chains web_search + fetch_url
 ├── docs/
 │   ├── decisions/              # ADRs (immutable)
 │   ├── design/                 # HLD + LLD (living, with Mermaid)
@@ -141,9 +146,16 @@ uv run python scripts/smoke_chat_ws_proxy.py
 # Smoke-test the agent loop (read_file + write_file with approval)
 uv run python scripts/smoke_agent.py
 
+# Smoke-test list_files directly (no agent, no LLM)
+uv run python scripts/smoke_list_files.py
+
 # Smoke-test web_search directly (no agent, no LLM) and through the agent
 uv run python scripts/smoke_web_search.py
 uv run python scripts/smoke_agent_web_search.py
+
+# Smoke-test fetch_url directly and through the agent (search + fetch chain)
+uv run python scripts/smoke_fetch_url.py
+uv run python scripts/smoke_agent_fetch_url.py
 
 # Add a dependency
 uv add <package>
