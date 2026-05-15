@@ -11,6 +11,7 @@ about WebSockets, and we can unit-test it with plain async fakes.
 """
 
 import logging
+import time
 import uuid
 from typing import Any, Awaitable, Callable
 
@@ -32,6 +33,30 @@ class AgentError(Exception):
 
 def _preview(text: str, n: int = 500) -> str:
     return text if len(text) <= n else text[:n] + f"… [truncated {len(text)-n} chars]"
+
+
+def _make_stats(
+    eval_tokens: int,
+    eval_ns: int,
+    prompt_tokens: int,
+    model_calls: int,
+    ttft_seconds: float | None,
+) -> dict[str, Any]:
+    eval_seconds = eval_ns / 1e9 if eval_ns else 0.0
+    tps = eval_tokens / eval_seconds if eval_seconds > 0 else 0.0
+    return {
+        "eval_tokens": eval_tokens,
+        "prompt_tokens": prompt_tokens,
+        "eval_seconds": round(eval_seconds, 2),
+        "tokens_per_sec": round(tps, 1),
+        "model_calls": model_calls,
+        # Wall-clock seconds from the start of the turn until the first
+        # text token is observed in the stream. None if the turn produced
+        # no text (e.g. tool-only iterations followed by an error). On a
+        # cold model load this dominates total latency, which is exactly
+        # why we surface it separately.
+        "ttft_seconds": round(ttft_seconds, 2) if ttft_seconds is not None else None,
+    }
 
 
 async def _dispatch_tool(
@@ -78,12 +103,13 @@ async def run_turn(
     client: AsyncClient,
     on_event: OnEvent,
     request_approval: RequestApproval,
-) -> str:
+) -> tuple[str, dict[str, Any]]:
     """Drive the loop until the model returns a final answer.
 
     `base_messages` is the system prompt + history + the new user turn.
-    On exit, the assistant's final text is returned; the caller persists
-    that to the conversation buffer.
+    Returns `(final_text, stats)`. Stats sums Ollama's per-iteration
+    `eval_count` / `eval_duration` so the caller can report tokens/sec
+    for the whole turn (a multi-step turn hits the model N times).
     """
     settings = get_settings()
     msgs = list(base_messages)  # local copy; we mutate as the loop progresses
@@ -93,6 +119,13 @@ async def run_turn(
 
     consecutive_errors = 0
     last_failed_tool: str | None = None
+
+    total_eval_tokens = 0
+    total_eval_ns = 0
+    total_prompt_tokens = 0
+    model_calls = 0
+    t_start = time.perf_counter()
+    t_first_token: float | None = None
 
     for step in range(settings.agent_max_steps):
         log.info("agent cid=%s step=%d", conversation_id, step)
@@ -111,9 +144,13 @@ async def run_turn(
 
         content_chunks: list[str] = []
         final_tool_calls: list = []
+        last_chunk = None
         async for chunk in stream:
+            last_chunk = chunk
             msg = chunk.message
             if msg.content:
+                if t_first_token is None:
+                    t_first_token = time.perf_counter()
                 content_chunks.append(msg.content)
                 await on_event(
                     {"type": "token", "delta": msg.content}
@@ -124,17 +161,36 @@ async def run_turn(
                 # can revisit when that bites.
                 final_tool_calls = list(msg.tool_calls)
 
+        # Ollama populates eval_count / eval_duration only on the final
+        # chunk (`done=True`). Use getattr so a model that omits them
+        # doesn't break the loop.
+        if last_chunk is not None:
+            total_eval_tokens += getattr(last_chunk, "eval_count", 0) or 0
+            total_eval_ns += getattr(last_chunk, "eval_duration", 0) or 0
+            total_prompt_tokens += getattr(last_chunk, "prompt_eval_count", 0) or 0
+            model_calls += 1
+
         content = "".join(content_chunks)
         tool_calls = final_tool_calls
 
         if not tool_calls:
+            ttft = (t_first_token - t_start) if t_first_token is not None else None
             log.info(
-                "agent cid=%s done step=%d reply_len=%d",
+                "agent cid=%s done step=%d reply_len=%d eval_tokens=%d eval_s=%.2f ttft_s=%s",
                 conversation_id,
                 step,
                 len(content),
+                total_eval_tokens,
+                total_eval_ns / 1e9,
+                f"{ttft:.2f}" if ttft is not None else "-",
             )
-            return content
+            return content, _make_stats(
+                total_eval_tokens,
+                total_eval_ns,
+                total_prompt_tokens,
+                model_calls,
+                ttft,
+            )
 
         # Append the assistant turn (with tool_calls) so the next iteration
         # sees a consistent transcript. Build the dict explicitly because we

@@ -30,6 +30,9 @@ async def main() -> int:
                 sys.stdout.write(frame["delta"])
                 sys.stdout.flush()
             elif ftype == "done":
+                stats = frame.get("stats")
+                if stats:
+                    print(f"\n[stats] {stats}")
                 break
             elif ftype == "error":
                 print(f"\n[error] {frame.get('error')}", file=sys.stderr)

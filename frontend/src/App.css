@@ -124,6 +124,13 @@ body {
   font-size: 14px;
 }
 
+.stats {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: #666;
+  margin-top: 4px;
+}
+
 .error {
   background: #4a1212;
   color: #ffb4b4;

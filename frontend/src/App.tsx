@@ -3,8 +3,17 @@ import './App.css'
 
 type Role = 'user' | 'assistant'
 
+interface TurnStats {
+  eval_tokens: number
+  prompt_tokens: number
+  eval_seconds: number
+  tokens_per_sec: number
+  model_calls: number
+  ttft_seconds: number | null
+}
+
 type TranscriptItem =
-  | { kind: 'message'; id: string; role: Role; content: string }
+  | { kind: 'message'; id: string; role: Role; content: string; stats?: TurnStats }
   | {
       kind: 'tool'
       id: string
@@ -23,6 +32,7 @@ interface TokenFrame {
 interface DoneFrame {
   type: 'done'
   conversation_id: string
+  stats?: TurnStats
 }
 interface ErrorFrame {
   type: 'error'
@@ -141,6 +151,21 @@ export default function App() {
         return next
       })
     } else if (frame.type === 'done') {
+      if (frame.stats) {
+        const stats = frame.stats
+        setTranscript((prev) => {
+          // Attach stats to the most recent assistant message in this turn.
+          for (let i = prev.length - 1; i >= 0; i--) {
+            const it = prev[i]
+            if (it.kind === 'message' && it.role === 'assistant') {
+              const next = prev.slice()
+              next[i] = { ...it, stats }
+              return next
+            }
+          }
+          return prev
+        })
+      }
       setBusy(false)
     } else if (frame.type === 'error') {
       setError(frame.error)
@@ -297,6 +322,7 @@ export default function App() {
             <div key={it.id} className={`msg ${it.role}`}>
               <div className="role">{it.role}</div>
               <div className="content">{it.content || (busy ? '…' : '')}</div>
+              {it.stats && <StatsLine stats={it.stats} />}
             </div>
           ) : (
             <ToolCard
@@ -326,6 +352,18 @@ export default function App() {
       </div>
     </div>
   )
+}
+
+function StatsLine({ stats }: { stats: TurnStats }) {
+  const parts = [
+    `${stats.tokens_per_sec.toFixed(1)} tok/s`,
+    `${stats.eval_tokens} tokens`,
+    `${stats.eval_seconds.toFixed(2)}s`,
+  ]
+  if (stats.ttft_seconds != null) parts.push(`ttft ${stats.ttft_seconds.toFixed(2)}s`)
+  if (stats.model_calls > 1) parts.push(`${stats.model_calls} calls`)
+  if (stats.prompt_tokens) parts.push(`prompt ${stats.prompt_tokens}`)
+  return <div className="stats">{parts.join(' · ')}</div>
 }
 
 function ToolCard({

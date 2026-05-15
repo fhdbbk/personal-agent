@@ -101,7 +101,7 @@ async def chat_stream(ws: WebSocket) -> None:
       {"type": "tool_call",     "call_id": "...", "name": "...", "args": {...}, "conversation_id": "..."}
       {"type": "tool_result",   "call_id": "...", "ok": true,    "preview": "...", "conversation_id": "..."}
       {"type": "tool_approval", "call_id": "...", "name": "...", "args": {...}, "conversation_id": "..."}
-      {"type": "done",          "conversation_id": "..."}
+      {"type": "done",          "conversation_id": "...", "stats": {"eval_tokens": N, "prompt_tokens": N, "eval_seconds": N.NN, "tokens_per_sec": N.N, "model_calls": N, "ttft_seconds": N.NN|null}}
       {"type": "error",         "error": "...",   "conversation_id": "..."}
 
     Client -> server:
@@ -157,7 +157,7 @@ async def chat_stream(ws: WebSocket) -> None:
 
             try:
                 base_msgs = _build_messages(req.conversation_id, req.message)
-                final = await run_turn(
+                final, stats = await run_turn(
                     conversation_id=req.conversation_id,
                     base_messages=base_msgs,
                     client=_client(),
@@ -165,15 +165,22 @@ async def chat_stream(ws: WebSocket) -> None:
                     request_approval=request_approval,
                 )
                 _persist_turn(req.conversation_id, req.message, final)
-                # The loop streamed token frames as they arrived; just close.
+                # The loop streamed token frames as they arrived. The done
+                # frame carries per-turn token stats so the UI can show
+                # tokens/sec under the assistant message.
                 await ws.send_json(
-                    {"type": "done", "conversation_id": req.conversation_id}
+                    {
+                        "type": "done",
+                        "conversation_id": req.conversation_id,
+                        "stats": stats,
+                    }
                 )
                 log.info(
-                    "ws turn done cid=%s reply_len=%d latency_ms=%d",
+                    "ws turn done cid=%s reply_len=%d latency_ms=%d tps=%.1f",
                     req.conversation_id,
                     len(final),
                     int((time.perf_counter() - t0) * 1000),
+                    stats.get("tokens_per_sec", 0.0),
                 )
             except AgentError as e:
                 log.warning("agent error cid=%s: %s", req.conversation_id, e)
