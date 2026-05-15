@@ -89,6 +89,17 @@ function wsUrl(path: string): string {
   return `${proto}//${window.location.host}${path}`
 }
 
+// Show "thinking…" only when the model is the bottleneck: nothing is
+// actively streaming and we're not blocked waiting for the user to
+// approve a tool. Catches the gap between iterations (tool_result → next
+// token) and the initial send (user_msg → first token).
+function shouldShowThinking(transcript: TranscriptItem[]): boolean {
+  const last = transcript[transcript.length - 1]
+  if (last?.kind === 'message' && last.role === 'assistant') return false
+  if (transcript.some((it) => it.kind === 'tool' && it.awaitingApproval)) return false
+  return true
+}
+
 type ConnState = 'connecting' | 'open' | 'closed'
 
 export default function App() {
@@ -321,7 +332,7 @@ export default function App() {
           it.kind === 'message' ? (
             <div key={it.id} className={`msg ${it.role}`}>
               <div className="role">{it.role}</div>
-              <div className="content">{it.content || (busy ? '…' : '')}</div>
+              <div className="content">{it.content}</div>
               {it.stats && <StatsLine stats={it.stats} />}
             </div>
           ) : (
@@ -332,6 +343,9 @@ export default function App() {
               onDeny={() => respondToApproval(it.call_id, false)}
             />
           ),
+        )}
+        {busy && shouldShowThinking(transcript) && (
+          <div className="thinking">thinking…</div>
         )}
       </div>
 
@@ -355,15 +369,42 @@ export default function App() {
 }
 
 function StatsLine({ stats }: { stats: TurnStats }) {
-  const parts = [
+  const parts: React.ReactNode[] = [
     `${stats.tokens_per_sec.toFixed(1)} tok/s`,
     `${stats.eval_tokens} tokens`,
     `${stats.eval_seconds.toFixed(2)}s`,
   ]
-  if (stats.ttft_seconds != null) parts.push(`ttft ${stats.ttft_seconds.toFixed(2)}s`)
-  if (stats.model_calls > 1) parts.push(`${stats.model_calls} calls`)
-  if (stats.prompt_tokens) parts.push(`prompt ${stats.prompt_tokens}`)
-  return <div className="stats">{parts.join(' · ')}</div>
+  if (stats.ttft_seconds != null) {
+    parts.push(
+      <span title="time to first token — wall-clock from send to the first streamed token">
+        ttft {stats.ttft_seconds.toFixed(2)}s
+      </span>,
+    )
+  }
+  if (stats.model_calls > 1) {
+    parts.push(
+      <span title="number of Ollama calls this turn (one per ReAct iteration)">
+        {stats.model_calls} calls
+      </span>,
+    )
+  }
+  if (stats.prompt_tokens) {
+    parts.push(
+      <span title="sum of prompt tokens across every model call this turn — compute cost, not context size. tool results inflate later calls but are not persisted.">
+        prompt {stats.prompt_tokens}
+      </span>,
+    )
+  }
+  return (
+    <div className="stats">
+      {parts.map((p, i) => (
+        <span key={i}>
+          {i > 0 && ' · '}
+          {p}
+        </span>
+      ))}
+    </div>
+  )
 }
 
 function ToolCard({
