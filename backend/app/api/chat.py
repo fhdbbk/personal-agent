@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from backend.app.agent.loop import AgentError, run_turn
 from backend.app.agent.prompt import system_prompt
-from backend.app.config import device_options, get_settings
+from backend.app.config import get_settings, ollama_options
 from backend.app.memory.buffer import Message, buffer
 
 router = APIRouter()
@@ -62,14 +62,12 @@ async def chat(req: ChatRequest) -> ChatResponse:
     log.info("chat cid=%s msg_len=%d", req.conversation_id, len(req.message))
     t0 = time.perf_counter()
     msgs = _build_messages(req.conversation_id, req.message)
-    options = device_options()
-    extra = {"options": options} if options else {}
     try:
         resp = await _client().chat(
             model=settings.ollama_model,
             messages=msgs,
             think=settings.ollama_think,
-            **extra,
+            options=ollama_options(),
         )
     except Exception:
         log.exception("chat failed cid=%s", req.conversation_id)

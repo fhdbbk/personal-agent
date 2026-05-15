@@ -17,7 +17,7 @@ from typing import Any, Awaitable, Callable
 
 from ollama import AsyncClient
 
-from backend.app.config import device_options, get_settings
+from backend.app.config import get_settings, ollama_options
 from backend.app.tools.registry import TOOLS, ollama_tool_specs
 
 log = logging.getLogger("pa.agent")
@@ -114,8 +114,7 @@ async def run_turn(
     settings = get_settings()
     msgs = list(base_messages)  # local copy; we mutate as the loop progresses
     tool_specs = ollama_tool_specs()
-    options = device_options()
-    extra = {"options": options} if options else {}
+    options = ollama_options()
 
     consecutive_errors = 0
     last_failed_tool: str | None = None
@@ -139,7 +138,7 @@ async def run_turn(
             tools=tool_specs,
             stream=True,
             think=settings.ollama_think,
-            **extra,
+            options=options,
         )
 
         content_chunks: list[str] = []

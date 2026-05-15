@@ -17,6 +17,11 @@ class Settings(BaseSettings):
     ollama_think: bool = Field(default=False)
     # auto = let Ollama decide; cpu = force num_gpu=0; gpu = force max offload.
     ollama_device: Device = Field(default="auto")
+    # Context window in tokens. Ollama defaults to 4096 — far smaller than
+    # what modern small models can handle (qwen2.5/3 trained at 32k natively;
+    # YaRN extends further with quality risk). 32k is a safe ceiling for our
+    # 16 GB target; bump to 65536 in .env if you have the VRAM headroom.
+    ollama_num_ctx: int = Field(default=32768)
     request_timeout_s: float = Field(default=60.0)
 
     # Phase 2 agent loop. See docs/decisions/0003-agent-loop.md.
@@ -34,11 +39,16 @@ def get_settings() -> Settings:
     return Settings()
 
 
-def device_options() -> dict | None:
-    """Translate PA_OLLAMA_DEVICE into an Ollama `options` dict, or None for auto."""
-    device = get_settings().ollama_device
-    if device == "cpu":
-        return {"num_gpu": 0}
-    if device == "gpu":
-        return {"num_gpu": 999}  # ollama clamps to the model's actual layer count
-    return None
+def ollama_options() -> dict:
+    """Build the Ollama `options` dict from settings.
+
+    Always returns a non-empty dict because `num_ctx` is always set —
+    callers can splat it unconditionally.
+    """
+    s = get_settings()
+    opts: dict = {"num_ctx": s.ollama_num_ctx}
+    if s.ollama_device == "cpu":
+        opts["num_gpu"] = 0
+    elif s.ollama_device == "gpu":
+        opts["num_gpu"] = 999  # ollama clamps to the model's actual layer count
+    return opts

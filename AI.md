@@ -169,6 +169,7 @@ All runtime config goes through [backend/app/config.py](backend/app/config.py) (
 - `PA_OLLAMA_MODEL` (default `qwen3.5:4b`)
 - `PA_OLLAMA_THINK` (default `false` — Qwen3 thinks-before-answering when on; off keeps replies snappy)
 - `PA_OLLAMA_DEVICE` (default `auto`; `cpu` forces `num_gpu=0`, `gpu` forces full offload)
+- `PA_OLLAMA_NUM_CTX` (default `32768` — Ollama itself defaults to 4096, which is too small once tool results enter the conversation; 32k is qwen2.5/3's native training window. Bump to 65536 if you have the VRAM and accept YaRN-extension quality risk past 32k.)
 - `PA_REQUEST_TIMEOUT_S` (default `60`)
 - `PA_AGENT_SANDBOX` (default `sandbox` — root for `read_file` / `write_file`)
 - `PA_AGENT_MAX_STEPS` (default `8` — abort the loop after this many model turns)
