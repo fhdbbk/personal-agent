@@ -229,6 +229,80 @@ async def test_tool_call_dispatch_emits_call_and_result_frames(monkeypatch):
     assert second_msgs[-1] == {"role": "tool", "content": "5"}
 
 
+async def test_tool_bad_args_returns_argument_error(monkeypatch):
+    """When the model passes wrong/missing kwargs the call raises
+    TypeError; the loop catches it and feeds back 'argument error' so
+    the model can self-correct (not the unknown-tool path)."""
+
+    async def add(a: int, b: int) -> str:
+        return str(a + b)
+
+    monkeypatch.setattr(
+        "backend.app.agent.loop.TOOLS",
+        {"add": Tool(name="add", fn=add, schema={}, requires_approval=False)},
+    )
+    client = FakeClient(
+        [
+            [_chunk(tool_calls=[_tc("add", {"a": 1})])],  # missing b
+            [
+                _chunk(
+                    content="let me retry",
+                    eval_count=1,
+                    eval_duration=1_000_000_000,
+                )
+            ],
+        ]
+    )
+    events = EventLog()
+
+    final, _ = await run_turn(
+        conversation_id="c1",
+        base_messages=[],
+        client=client,
+        on_event=events,
+        request_approval=_allow,
+    )
+
+    assert final == "let me retry"
+    tr = next(f for f in events.frames if f["type"] == "tool_result")
+    assert tr["ok"] is False
+    assert "argument error" in tr["preview"].lower()
+
+
+async def test_client_chat_receives_options_and_tools_per_iteration():
+    """Plumbing check: run_turn must hand options (incl. num_ctx) and
+    tool specs to AsyncClient.chat on every iteration, and request
+    streaming. Catches regressions where one of these gets dropped on
+    the multi-iteration code path."""
+    client = FakeClient(
+        [
+            [
+                _chunk(
+                    content="hi",
+                    eval_count=1,
+                    eval_duration=1_000_000_000,
+                )
+            ],
+        ]
+    )
+
+    await run_turn(
+        conversation_id="c1",
+        base_messages=[{"role": "user", "content": "hello"}],
+        client=client,
+        on_event=EventLog(),
+        request_approval=_allow,
+    )
+
+    assert len(client.calls) == 1
+    kwargs = client.calls[0]
+    assert kwargs["stream"] is True
+    assert kwargs["options"]["num_ctx"] == get_settings().ollama_num_ctx
+    assert "tools" in kwargs and isinstance(kwargs["tools"], list)
+    # System+history were forwarded as messages, not lost.
+    assert kwargs["messages"] == [{"role": "user", "content": "hello"}]
+
+
 async def test_unknown_tool_emits_error_result_for_model(monkeypatch):
     """When the model hallucinates a tool name, the error gets fed
     back as a tool_result with ok=False so the model can self-correct."""
