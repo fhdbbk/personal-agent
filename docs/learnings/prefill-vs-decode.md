@@ -37,6 +37,22 @@ Ratio: prefill cost per token (~28 ms) is in the same ballpark as decode cost pe
 
 The mental model: `total ≈ prefill + N_out × decode_per_token`. Prompt length is the lever for the first term, output length for the second.
 
+## How Ollama reports these on the wire
+
+Ollama's `chat()` response surfaces the prefill/decode split as three fields on the **final** chunk of a stream (`done=True`); intermediate chunks have them as `None`:
+
+| Field | What it counts |
+|---|---|
+| `prompt_eval_count` | Tokens in the **input** — system prompt + history + tool definitions + any tool results so far. This is the prefill work. |
+| `eval_count` | Tokens the model **generated** this call. This is the decode work. |
+| `eval_duration` | Nanoseconds spent generating those output tokens. `eval_count / (eval_duration / 1e9)` → tokens/sec. |
+
+There's also `prompt_eval_duration` for prefill time and `load_duration` for the cold model-load cost, which we don't currently surface.
+
+[backend/app/agent/loop.py:163-169](../../backend/app/agent/loop.py#L163-L169) accumulates these across every iteration of a ReAct turn — one user message can trigger multiple `chat()` calls (model → tool → model → …), each with its own prefill + decode. The loop sums them so the WebSocket handler can report a single per-turn figure.
+
+Worth knowing for tests: forging these fields in a fake `ChatResponse` (e.g. [backend/tests/test_agent_loop.py:107-112](../../backend/tests/test_agent_loop.py#L107-L112)) is how we assert the loop's aggregation logic adds up correctly without a live Ollama. See also [pytest-patterns.md](pytest-patterns.md).
+
 ## Why CPU vs GPU matters more for prefill
 
 Prefill is one giant matrix multiplication that parallelizes beautifully — exactly what GPU tensor cores are designed for. CPUs do it serially-ish (SIMD helps but can't fully close the gap). Decode is tiny matmuls; the parallelism advantage matters less.
