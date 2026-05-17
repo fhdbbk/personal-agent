@@ -5,26 +5,21 @@ from backend.app.tools._sandbox import safe_path
 MAX_BYTES = 64_000  # ~16k tokens at 4 chars/token; keeps a single tool result well under the model's context.
 
 
-SCHEMA: dict = {
-    "type": "function",
-    "function": {
-        "name": "read_file",
-        "description": (
-            "Read a UTF-8 text file from the agent sandbox. Use this to "
-            "inspect files the user placed there or that earlier tool calls "
-            "created. Returns the file contents as a string."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Path relative to the sandbox root.",
-                },
-            },
-            "required": ["path"],
+NAME = "read_file"
+DESCRIPTION = (
+    "Read a UTF-8 text file from the agent sandbox. Use this to "
+    "inspect files the user placed there or that earlier tool calls "
+    "created. Returns the file contents as a string."
+)
+PARAMETERS: dict = {
+    "type": "object",
+    "properties": {
+        "path": {
+            "type": "string",
+            "description": "Path relative to the sandbox root.",
         },
     },
+    "required": ["path"],
 }
 
 

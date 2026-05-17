@@ -5,10 +5,14 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 Device = Literal["auto", "cpu", "gpu"]
+LLMProviderName = Literal["ollama", "anthropic", "openai"]
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="PA_", env_file=".env", extra="ignore")
+
+    # LLM backend selection. Each provider reads its own subset below.
+    llm_provider: LLMProviderName = Field(default="ollama")
 
     ollama_host: str = Field(default="http://localhost:11434")
     ollama_model: str = Field(default="qwen3.5:4b")
@@ -23,6 +27,17 @@ class Settings(BaseSettings):
     # 16 GB target; bump to 65536 in .env if you have the VRAM headroom.
     ollama_num_ctx: int = Field(default=32768)
     request_timeout_s: float = Field(default=60.0)
+
+    # Anthropic — read only when llm_provider="anthropic".
+    anthropic_api_key: str = Field(default="")
+    anthropic_model: str = Field(default="claude-haiku-4-5")
+    # Anthropic's Messages API requires max_tokens. Generous default; the
+    # tool-using loop typically produces short replies between tool calls.
+    anthropic_max_tokens: int = Field(default=4096)
+
+    # OpenAI — read only when llm_provider="openai".
+    openai_api_key: str = Field(default="")
+    openai_model: str = Field(default="gpt-4o-mini")
 
     # Phase 2 agent loop. See docs/decisions/0003-agent-loop.md.
     agent_sandbox: str = Field(default="sandbox")

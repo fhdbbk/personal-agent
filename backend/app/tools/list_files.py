@@ -16,30 +16,25 @@ from backend.app.tools._sandbox import safe_path
 MAX_ENTRIES = 200  # cap so a runaway directory doesn't blow up the context window
 
 
-SCHEMA: dict = {
-    "type": "function",
-    "function": {
-        "name": "list_files",
-        "description": (
-            "List the entries in a directory inside the agent sandbox. "
-            "Use this to discover what files exist before reading them. "
-            "Returns a sorted listing (directories first, then files) "
-            "with sizes. Non-recursive — pass a sub-path to descend."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": (
-                        "Path relative to the sandbox root. Use \".\" "
-                        "for the sandbox root itself."
-                    ),
-                },
-            },
-            "required": ["path"],
+NAME = "list_files"
+DESCRIPTION = (
+    "List the entries in a directory inside the agent sandbox. "
+    "Use this to discover what files exist before reading them. "
+    "Returns a sorted listing (directories first, then files) "
+    "with sizes. Non-recursive — pass a sub-path to descend."
+)
+PARAMETERS: dict = {
+    "type": "object",
+    "properties": {
+        "path": {
+            "type": "string",
+            "description": (
+                "Path relative to the sandbox root. Use \".\" "
+                "for the sandbox root itself."
+            ),
         },
     },
+    "required": ["path"],
 }
 
 

@@ -5,9 +5,11 @@ description = "Local-first agentic personal assistant running on CPU"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "anthropic>=0.102.0",
     "ddgs>=9.14.2",
     "fastapi>=0.136.1",
     "ollama>=0.6.2",
+    "openai>=2.37.0",
     "pydantic>=2.13.3",
     "pydantic-settings>=2.14.0",
     "trafilatura>=2.0.0",

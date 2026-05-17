@@ -3,12 +3,11 @@ import time
 from functools import lru_cache
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from ollama import AsyncClient
 from pydantic import BaseModel, Field
 
 from backend.app.agent.loop import AgentError, run_turn
 from backend.app.agent.prompt import system_prompt
-from backend.app.config import get_settings, ollama_options
+from backend.app.llm import LLMMessage, LLMProvider, get_provider
 from backend.app.memory.buffer import Message, buffer
 
 router = APIRouter()
@@ -35,19 +34,15 @@ class ResetResponse(BaseModel):
 
 
 @lru_cache
-def _client() -> AsyncClient:
-    # ollama forwards kwargs to httpx.AsyncClient. For streaming calls the
-    # read-timeout becomes a per-chunk idle timeout, which is what we want:
-    # a long generation is fine, a stalled connection aborts.
-    s = get_settings()
-    return AsyncClient(host=s.ollama_host, timeout=s.request_timeout_s)
+def _provider() -> LLMProvider:
+    return get_provider()
 
 
-def _build_messages(conversation_id: str, user_text: str) -> list[dict[str, str]]:
+def _build_messages(conversation_id: str, user_text: str) -> list[LLMMessage]:
     history = buffer.history(conversation_id)
-    msgs: list[dict[str, str]] = [{"role": "system", "content": system_prompt()}]
-    msgs.extend({"role": m.role, "content": m.content} for m in history)
-    msgs.append({"role": "user", "content": user_text})
+    msgs: list[LLMMessage] = [LLMMessage(role="system", content=system_prompt())]
+    msgs.extend(LLMMessage(role=m.role, content=m.content) for m in history)
+    msgs.append(LLMMessage(role="user", content=user_text))
     return msgs
 
 
@@ -58,21 +53,35 @@ def _persist_turn(conversation_id: str, user_text: str, reply: str) -> None:
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest) -> ChatResponse:
-    settings = get_settings()
+    """Non-streaming chat for clients that don't speak WebSocket. Routes
+    through `run_turn` with no-op event callbacks so behaviour matches the
+    WS path (system prompt, tool calls, etc.)."""
     log.info("chat cid=%s msg_len=%d", req.conversation_id, len(req.message))
     t0 = time.perf_counter()
     msgs = _build_messages(req.conversation_id, req.message)
+
+    async def _noop_event(_frame: dict) -> None:
+        return None
+
+    async def _auto_deny(_call_id: str, _name: str, _args: dict) -> bool:
+        # Approval-gated tools (write_file, fetch_url) can't be approved
+        # over the non-streaming HTTP path. Deny here; the loop turns
+        # denial into a "User denied this action." tool result so the
+        # model can adapt rather than crash.
+        return False
+
     try:
-        resp = await _client().chat(
-            model=settings.ollama_model,
-            messages=msgs,
-            think=settings.ollama_think,
-            options=ollama_options(),
+        reply, _stats = await run_turn(
+            conversation_id=req.conversation_id,
+            base_messages=msgs,
+            provider=_provider(),
+            on_event=_noop_event,
+            request_approval=_auto_deny,
         )
     except Exception:
         log.exception("chat failed cid=%s", req.conversation_id)
         raise
-    reply = resp["message"]["content"]
+
     _persist_turn(req.conversation_id, req.message, reply)
     log.info(
         "chat done cid=%s reply_len=%d latency_ms=%d",
@@ -158,7 +167,7 @@ async def chat_stream(ws: WebSocket) -> None:
                 final, stats = await run_turn(
                     conversation_id=req.conversation_id,
                     base_messages=base_msgs,
-                    client=_client(),
+                    provider=_provider(),
                     on_event=on_event,
                     request_approval=request_approval,
                 )

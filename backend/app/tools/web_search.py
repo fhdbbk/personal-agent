@@ -19,28 +19,23 @@ log = logging.getLogger("pa.tool.web_search")
 
 MAX_RESULTS = 5
 
-SCHEMA: dict = {
-    "type": "function",
-    "function": {
-        "name": "web_search",
-        "description": (
-            "Search the web via DuckDuckGo and return the top results as a "
-            "numbered list with title, URL, and snippet. Use this when the "
-            "answer needs information that is not in the conversation, the "
-            "sandbox, or your training data — for example current events, "
-            "recent releases, or facts you are unsure about."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Plain-text search query.",
-                },
-            },
-            "required": ["query"],
+NAME = "web_search"
+DESCRIPTION = (
+    "Search the web via DuckDuckGo and return the top results as a "
+    "numbered list with title, URL, and snippet. Use this when the "
+    "answer needs information that is not in the conversation, the "
+    "sandbox, or your training data — for example current events, "
+    "recent releases, or facts you are unsure about."
+)
+PARAMETERS: dict = {
+    "type": "object",
+    "properties": {
+        "query": {
+            "type": "string",
+            "description": "Plain-text search query.",
         },
     },
+    "required": ["query"],
 }
 
 

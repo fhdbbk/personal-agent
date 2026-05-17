@@ -1,9 +1,10 @@
 """Phase 2 agent loop. See docs/decisions/0003-agent-loop.md.
 
-Sequential ReAct: each iteration is one non-streaming Ollama call. If the
-response carries tool_calls we dispatch them one at a time, append the
-result as a {"role":"tool",...} message, and loop. If it carries no
-tool_calls, that text is the final answer.
+Sequential ReAct: each iteration is one streaming call to the configured
+LLM provider (see [backend/app/llm/base.py]). If the response carries
+tool_calls we dispatch them one at a time, append the result as a
+{"role":"tool",...} message, and loop. If it carries no tool_calls, that
+text is the final answer.
 
 The loop is transport-agnostic — it talks to the WS handler through two
 callbacks (`on_event`, `request_approval`) so this file knows nothing
@@ -15,10 +16,9 @@ import time
 import uuid
 from typing import Any, Awaitable, Callable
 
-from ollama import AsyncClient
-
-from backend.app.config import get_settings, ollama_options
-from backend.app.tools.registry import TOOLS, ollama_tool_specs
+from backend.app.config import get_settings
+from backend.app.llm.base import LLMMessage, LLMProvider, LLMToolCall
+from backend.app.tools.registry import TOOLS
 
 log = logging.getLogger("pa.agent")
 
@@ -99,22 +99,21 @@ async def _dispatch_tool(
 async def run_turn(
     *,
     conversation_id: str,
-    base_messages: list[dict[str, Any]],
-    client: AsyncClient,
+    base_messages: list[LLMMessage],
+    provider: LLMProvider,
     on_event: OnEvent,
     request_approval: RequestApproval,
 ) -> tuple[str, dict[str, Any]]:
     """Drive the loop until the model returns a final answer.
 
     `base_messages` is the system prompt + history + the new user turn.
-    Returns `(final_text, stats)`. Stats sums Ollama's per-iteration
-    `eval_count` / `eval_duration` so the caller can report tokens/sec
-    for the whole turn (a multi-step turn hits the model N times).
+    Returns `(final_text, stats)`. Stats sums the provider's per-iteration
+    usage so the caller can report tokens/sec for the whole turn (a
+    multi-step turn hits the model N times).
     """
     settings = get_settings()
-    msgs = list(base_messages)  # local copy; we mutate as the loop progresses
-    tool_specs = ollama_tool_specs()
-    options = ollama_options()
+    msgs: list[LLMMessage] = list(base_messages)  # local copy; mutated below
+    tools = list(TOOLS.values())
 
     consecutive_errors = 0
     last_failed_tool: str | None = None
@@ -128,45 +127,28 @@ async def run_turn(
 
     for step in range(settings.agent_max_steps):
         log.info("agent cid=%s step=%d", conversation_id, step)
-        # Stream every iteration. Content deltas are forwarded to the UI as
-        # token frames as they arrive; tool_calls (when present) come in a
-        # late chunk and only matter once the stream finishes. Probed against
-        # qwen3.5:4b — see docs/learnings/streaming-with-tools.md.
-        stream = await client.chat(
-            model=settings.ollama_model,
-            messages=msgs,
-            tools=tool_specs,
-            stream=True,
-            think=settings.ollama_think,
-            options=options,
-        )
-
+        # Stream every iteration. Text deltas are forwarded to the UI as
+        # token frames as they arrive; tool_calls land on the final chunk
+        # (the provider's job to assemble them).
         content_chunks: list[str] = []
-        final_tool_calls: list = []
-        last_chunk = None
-        async for chunk in stream:
-            last_chunk = chunk
-            msg = chunk.message
-            if msg.content:
+        final_tool_calls: list[LLMToolCall] = []
+        usage = None
+
+        async for chunk in provider.chat_stream(msgs, tools):
+            if chunk.delta_text:
                 if t_first_token is None:
                     t_first_token = time.perf_counter()
-                content_chunks.append(msg.content)
-                await on_event(
-                    {"type": "token", "delta": msg.content}
-                )
-            if msg.tool_calls:
-                # Probe shows tool_calls arrive complete in one chunk. If a
-                # future Ollama version splits them, the last one wins — we
-                # can revisit when that bites.
-                final_tool_calls = list(msg.tool_calls)
+                content_chunks.append(chunk.delta_text)
+                await on_event({"type": "token", "delta": chunk.delta_text})
+            if chunk.done:
+                if chunk.tool_calls:
+                    final_tool_calls = chunk.tool_calls
+                usage = chunk.usage
 
-        # Ollama populates eval_count / eval_duration only on the final
-        # chunk (`done=True`). Use getattr so a model that omits them
-        # doesn't break the loop.
-        if last_chunk is not None:
-            total_eval_tokens += getattr(last_chunk, "eval_count", 0) or 0
-            total_eval_ns += getattr(last_chunk, "eval_duration", 0) or 0
-            total_prompt_tokens += getattr(last_chunk, "prompt_eval_count", 0) or 0
+        if usage is not None:
+            total_eval_tokens += usage.completion_tokens
+            total_prompt_tokens += usage.prompt_tokens
+            total_eval_ns += usage.duration_ns or 0
             model_calls += 1
 
         content = "".join(content_chunks)
@@ -192,33 +174,26 @@ async def run_turn(
             )
 
         # Append the assistant turn (with tool_calls) so the next iteration
-        # sees a consistent transcript. Build the dict explicitly because we
-        # don't have a single Message object after streaming.
+        # sees a consistent transcript.
         msgs.append(
-            {
-                "role": "assistant",
-                "content": content,
-                "tool_calls": [tc.model_dump() for tc in tool_calls],
-            }
+            LLMMessage(role="assistant", content=content, tool_calls=tool_calls)
         )
 
         for tc in tool_calls:
-            name = tc.function.name
-            args = dict(tc.function.arguments or {})
             call_id = f"call_{uuid.uuid4().hex[:12]}"
 
             await on_event(
                 {
                     "type": "tool_call",
                     "call_id": call_id,
-                    "name": name,
-                    "args": args,
+                    "name": tc.name,
+                    "args": tc.arguments,
                 }
             )
 
             ok, result = await _dispatch_tool(
-                name,
-                args,
+                tc.name,
+                tc.arguments,
                 call_id=call_id,
                 request_approval=request_approval,
             )
@@ -236,19 +211,23 @@ async def run_turn(
                 consecutive_errors = 0
                 last_failed_tool = None
             else:
-                if last_failed_tool == name:
+                if last_failed_tool == tc.name:
                     consecutive_errors += 1
                 else:
                     consecutive_errors = 1
-                    last_failed_tool = name
+                    last_failed_tool = tc.name
                 if consecutive_errors > settings.agent_max_retries_per_tool:
                     raise AgentError(
-                        f"tool {name!r} failed {consecutive_errors} times in a row;"
+                        f"tool {tc.name!r} failed {consecutive_errors} times in a row;"
                         f" last error: {result}"
                     )
 
             # The model gets the full result, not the truncated preview.
-            msgs.append({"role": "tool", "content": result})
+            # tool_call_id is what Anthropic / OpenAI use to correlate this
+            # result with the originating tool_use block; Ollama ignores it.
+            msgs.append(
+                LLMMessage(role="tool", content=result, tool_call_id=tc.id)
+            )
 
     raise AgentError(
         f"agent exceeded MAX_STEPS={settings.agent_max_steps} without a final answer"

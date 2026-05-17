@@ -10,17 +10,18 @@
 4. [Frame protocol (WebSocket)](#4-frame-protocol-websocket)
 5. [Agent loop](#5-agent-loop)
 6. [Tool registry](#6-tool-registry)
-7. [Tools and sandbox](#7-tools-and-sandbox)
-8. [Memory — short-term ring buffer](#8-memory--short-term-ring-buffer)
-9. [Prompt assembly](#9-prompt-assembly)
-10. [Configuration](#10-configuration)
-11. [Logging](#11-logging)
-12. [Frontend](#12-frontend)
-13. [Phase 3 — long-term memory (planned)](#13-phase-3-long-term-memory-planned)
-14. [Phase 4 — voice I/O (planned)](#14-phase-4-voice-io-planned)
-15. [Phase 5 — calendar tools (planned)](#15-phase-5-calendar-tools-planned)
-16. [Phase 6 — hot paths (planned)](#16-phase-6-hot-paths-planned)
-17. [Phase 7 — mobile (planned)](#17-phase-7-mobile-planned)
+7. [LLM providers](#7-llm-providers)
+8. [Tools and sandbox](#8-tools-and-sandbox)
+9. [Memory — short-term ring buffer](#9-memory--short-term-ring-buffer)
+10. [Prompt assembly](#10-prompt-assembly)
+11. [Configuration](#11-configuration)
+12. [Logging](#12-logging)
+13. [Frontend](#13-frontend)
+14. [Phase 3 — long-term memory (planned)](#14-phase-3-long-term-memory-planned)
+15. [Phase 4 — voice I/O (planned)](#15-phase-4-voice-io-planned)
+16. [Phase 5 — calendar tools (planned)](#16-phase-5-calendar-tools-planned)
+17. [Phase 6 — hot paths (planned)](#17-phase-6-hot-paths-planned)
+18. [Phase 7 — mobile (planned)](#18-phase-7-mobile-planned)
 
 ---
 
@@ -33,10 +34,27 @@ flowchart TB
         chat["api/chat.py<br/>routers + WS handler"]
         loop["agent/loop.py<br/>run_turn(), _dispatch_tool()"]
         prompt["agent/prompt.py<br/>system_prompt()"]
-        registry["tools/registry.py<br/>Tool, TOOLS, ollama_tool_specs()"]
+
+        subgraph llm ["llm/ — provider abstraction (ADR 0007)"]
+            base["base.py<br/>LLMProvider Protocol<br/>+ LLMMessage / LLMChunk /<br/>LLMToolCall / LLMUsage"]
+            ollama_p["ollama.py<br/>OllamaProvider"]
+            anth_p["anthropic.py<br/>AnthropicProvider"]
+            openai_p["openai.py<br/>OpenAIProvider"]
+            llm_init["__init__.py<br/>get_provider() factory"]
+            llm_init -.->|lazy import| ollama_p
+            llm_init -.->|lazy import| anth_p
+            llm_init -.->|lazy import| openai_p
+            ollama_p --> base
+            anth_p --> base
+            openai_p --> base
+        end
+
+        registry["tools/registry.py<br/>Tool, TOOLS,<br/>3 per-provider formatters"]
         readf["tools/read_file.py"]
         writef["tools/write_file.py"]
+        listf["tools/list_files.py"]
         websearch["tools/web_search.py<br/>(ddgs)"]
+        fetchurl["tools/fetch_url.py<br/>(primp + trafilatura)"]
         sandbox["tools/_sandbox.py<br/>safe_path()"]
         buffer["memory/buffer.py<br/>ConversationBuffer"]
         cfg["config.py<br/>Settings, get_settings()"]
@@ -46,29 +64,38 @@ flowchart TB
         main --> cfg
         main --> logc
         chat --> loop
+        chat --> llm_init
         chat --> prompt
         chat --> buffer
         chat --> cfg
+        loop --> llm
         loop --> registry
         loop --> cfg
         registry --> readf
         registry --> writef
+        registry --> listf
         registry --> websearch
+        registry --> fetchurl
         readf --> sandbox
         writef --> sandbox
+        listf --> sandbox
         sandbox --> cfg
         prompt -.->|reads| soul[("SOUL.md")]
         readf --> sb[("sandbox/")]
         writef --> sb
+        listf --> sb
         logc --> logfiles[("logs/pa.log*")]
     end
 
     proc <-->|WS + HTTP| browser(["Browser"])
-    proc -->|httpx async| ollama(["Ollama daemon"])
+    ollama_p -->|httpx async| ollama(["Ollama daemon"])
+    anth_p -.->|HTTPS| anthropic_api(["Anthropic API"])
+    openai_p -.->|HTTPS| openai_api(["OpenAI API"])
     websearch -->|primp HTTP| ddg(["DuckDuckGo"])
+    fetchurl -->|primp HTTP| web(["public web"])
 ```
 
-The whole backend is a single uvicorn process. All singletons (`get_settings()`, `_client()`, `buffer`) live for the process lifetime.
+The whole backend is a single uvicorn process. All singletons (`get_settings()`, `_provider()`, `buffer`) live for the process lifetime. The cloud-provider edges are dashed because only one adapter is active per process — picked by `PA_LLM_PROVIDER` at startup, with the other adapters' SDKs imported lazily inside `get_provider()`.
 
 ---
 
@@ -78,18 +105,23 @@ These few small types flow between layers. Keeping them here avoids duplicating 
 
 | Type | Location | Shape | Notes |
 |---|---|---|---|
-| `Message` | [memory/buffer.py:8](../../backend/app/memory/buffer.py#L8) | `dataclass(frozen=True)` with `role: Literal["user","assistant"]`, `content: str` | Frozen so the buffer can't be mutated under callers; hashable by side-effect |
+| `Message` | [memory/buffer.py:8](../../backend/app/memory/buffer.py#L8) | `dataclass(frozen=True)` with `role: Literal["user","assistant"]`, `content: str` | Buffer's persistence type — different from `LLMMessage` (below), which is the loop's working type |
 | `Role` | [memory/buffer.py:5](../../backend/app/memory/buffer.py#L5) | `Literal["user", "assistant"]` | Tool messages use the raw `"tool"` string in the loop, not this alias |
-| `Tool` | [tools/registry.py:21](../../backend/app/tools/registry.py#L21) | `dataclass(frozen=True)`: `name`, `fn`, `schema`, `requires_approval` | `fn: Callable[..., Awaitable[str]]` — async returning a string |
-| `ChatRequest` | [api/chat.py:18](../../backend/app/api/chat.py#L18) | Pydantic: `conversation_id: str (min_length=1)`, `message: str (min_length=1)` | Reused by both HTTP and WS endpoints |
-| `ChatResponse` | [api/chat.py:23](../../backend/app/api/chat.py#L23) | Pydantic: `conversation_id`, `reply` | HTTP only |
-| `ResetRequest` / `ResetResponse` | [api/chat.py:28](../../backend/app/api/chat.py#L28), [:32](../../backend/app/api/chat.py#L32) | Pydantic | Used by `POST /chat/reset` |
-| `Settings` | [config.py:10](../../backend/app/config.py#L10) | `pydantic-settings` BaseSettings, env prefix `PA_`, reads `.env` | Singleton via `@lru_cache get_settings()` |
-| `OnEvent` | [agent/loop.py:24](../../backend/app/agent/loop.py#L24) | `Callable[[dict[str, Any]], Awaitable[None]]` | Push-only callback for emitting frames |
-| `RequestApproval` | [agent/loop.py:25](../../backend/app/agent/loop.py#L25) | `Callable[[str, str, dict[str, Any]], Awaitable[bool]]` | Pull callback: `(call_id, name, args) → approved` |
-| `AgentError` | [agent/loop.py:28](../../backend/app/agent/loop.py#L28) | Exception | Loop couldn't produce an answer (max steps, repeated tool errors) |
-| `SandboxError` | [tools/_sandbox.py:13](../../backend/app/tools/_sandbox.py#L13) | `ValueError` subclass | Path argument escaped the sandbox |
-| `ToolError` | [tools/registry.py:16](../../backend/app/tools/registry.py#L16) | Exception | Defined but currently unused; tools return error strings, not exceptions |
+| `LLMMessage` | [llm/base.py](../../backend/app/llm/base.py) | `dataclass`: `role: Literal["system","user","assistant","tool"]`, `content`, optional `tool_calls`, optional `tool_call_id` | The working type passed through the loop and into providers; provider adapters translate to their SDK's native shape |
+| `LLMToolCall` | [llm/base.py](../../backend/app/llm/base.py) | `dataclass`: `id, name, arguments` | `id` is end-to-end so cloud providers can correlate `tool_use` ↔ `tool_result`; Ollama adapter synthesizes `tc_<n>` |
+| `LLMUsage` | [llm/base.py](../../backend/app/llm/base.py) | `dataclass`: `prompt_tokens`, `completion_tokens`, `duration_ns` | Cloud adapters approximate `duration_ns` with wall-clock; Ollama reports true decode time |
+| `LLMChunk` | [llm/base.py](../../backend/app/llm/base.py) | `dataclass`: `delta_text`, `tool_calls`, `done`, `usage` | Yielded by `chat_stream`. Tool calls only on the final chunk, fully assembled. Usage only when `done=True` |
+| `LLMProvider` | [llm/base.py](../../backend/app/llm/base.py) | `typing.Protocol` with one method: `chat_stream(messages, tools) → AsyncIterator[LLMChunk]` | Adapters are duck-typed; no inheritance |
+| `Tool` | [tools/registry.py](../../backend/app/tools/registry.py) | `dataclass(frozen=True)`: `name`, `description`, `parameters`, `fn`, `requires_approval` | `parameters` is the inner JSON Schema (no provider envelope); per-provider formatters wrap it |
+| `ChatRequest` | [api/chat.py](../../backend/app/api/chat.py) | Pydantic: `conversation_id: str (min_length=1)`, `message: str (min_length=1)` | Reused by both HTTP and WS endpoints |
+| `ChatResponse` | [api/chat.py](../../backend/app/api/chat.py) | Pydantic: `conversation_id`, `reply` | HTTP only |
+| `ResetRequest` / `ResetResponse` | [api/chat.py](../../backend/app/api/chat.py) | Pydantic | Used by `POST /chat/reset` |
+| `Settings` | [config.py](../../backend/app/config.py) | `pydantic-settings` BaseSettings, env prefix `PA_`, reads `.env` | Singleton via `@lru_cache get_settings()` |
+| `OnEvent` | [agent/loop.py](../../backend/app/agent/loop.py) | `Callable[[dict[str, Any]], Awaitable[None]]` | Push-only callback for emitting frames |
+| `RequestApproval` | [agent/loop.py](../../backend/app/agent/loop.py) | `Callable[[str, str, dict[str, Any]], Awaitable[bool]]` | Pull callback: `(call_id, name, args) → approved` |
+| `AgentError` | [agent/loop.py](../../backend/app/agent/loop.py) | Exception | Loop couldn't produce an answer (max steps, repeated tool errors) |
+| `SandboxError` | [tools/_sandbox.py](../../backend/app/tools/_sandbox.py) | `ValueError` subclass | Path argument escaped the sandbox |
+| `ToolError` | [tools/registry.py](../../backend/app/tools/registry.py) | Exception | Defined but currently unused; tools return error strings, not exceptions |
 
 ```mermaid
 classDiagram
@@ -98,11 +130,42 @@ classDiagram
         +role: Role
         +content: str
     }
+    class LLMMessage {
+        <<dataclass>>
+        +role: Literal[system,user,assistant,tool]
+        +content: str
+        +tool_calls: list[LLMToolCall] | None
+        +tool_call_id: str | None
+    }
+    class LLMToolCall {
+        <<dataclass>>
+        +id: str
+        +name: str
+        +arguments: dict
+    }
+    class LLMChunk {
+        <<dataclass>>
+        +delta_text: str | None
+        +tool_calls: list[LLMToolCall] | None
+        +done: bool
+        +usage: LLMUsage | None
+    }
+    class LLMUsage {
+        <<dataclass>>
+        +prompt_tokens: int
+        +completion_tokens: int
+        +duration_ns: int | None
+    }
+    class LLMProvider {
+        <<Protocol>>
+        +chat_stream(messages, tools) AsyncIterator~LLMChunk~
+    }
     class Tool {
         <<frozen dataclass>>
         +name: str
+        +description: str
+        +parameters: dict
         +fn: async (...) -> str
-        +schema: dict
         +requires_approval: bool
     }
     class ConversationBuffer {
@@ -112,22 +175,16 @@ classDiagram
         +history(cid) list[Message]
         +clear(cid)
     }
-    class Settings {
-        <<BaseSettings>>
-        +ollama_host: str
-        +ollama_model: str
-        +ollama_think: bool
-        +ollama_device: Device
-        +request_timeout_s: float
-        +agent_sandbox: str
-        +agent_max_steps: int
-        +agent_max_retries_per_tool: int
-        +agent_auto_approve: bool
-        +log_dir: str
-        +log_level: str
-    }
+    LLMMessage --> LLMToolCall : assistant turns carry calls;<br/>tool turns carry an id
+    LLMChunk --> LLMToolCall : final chunk surfaces<br/>assembled calls
+    LLMChunk --> LLMUsage : final chunk carries usage
+    LLMProvider ..> LLMChunk : yields
+    LLMProvider ..> LLMMessage : consumes
+    LLMProvider ..> Tool : consumes
     ConversationBuffer "1" *-- "*" Message : stores
 ```
+
+A note on the two message types: `Message` (in `memory/buffer.py`) is the **persistence** shape — what we store between turns. `LLMMessage` (in `llm/base.py`) is the **working** shape — what the loop manipulates inside a turn (assistant turns with tool_calls, role="tool" results with `tool_call_id`). The chat endpoint translates persisted `Message`s into `LLMMessage`s when building each turn's base messages.
 
 ---
 
@@ -139,32 +196,28 @@ classDiagram
 
 - Accept HTTP requests for non-streaming chat and conversation reset.
 - Hold the long-lived WebSocket and drive one agent turn per inbound message.
-- Construct the message list passed to the loop (system prompt + history + new turn).
+- Construct the message list passed to the loop (system prompt + history + new turn) as `LLMMessage` objects.
 - Persist completed turns to the conversation buffer.
-- Manage the lazy singleton Ollama [`AsyncClient`](https://github.com/ollama/ollama-python).
+- Manage the lazy singleton `LLMProvider` ([`_provider()`](../../backend/app/api/chat.py)) — concrete adapter chosen by `PA_LLM_PROVIDER`.
 
 ### Endpoints
 
 | Method | Path | Request | Response | Use |
 |---|---|---|---|---|
-| `POST` | `/chat` | `ChatRequest` | `ChatResponse` | Non-streaming, no tools. Fallback / smoke. [chat.py:73](../../backend/app/api/chat.py#L73) |
-| `POST` | `/chat/reset` | `ResetRequest` | `ResetResponse` | Drop a conversation from the buffer. [chat.py:102](../../backend/app/api/chat.py#L102) |
-| `WS` | `/chat/stream` | (frames) | (frames) | The main entry point. [chat.py:109](../../backend/app/api/chat.py#L109) |
-| `GET` | `/health` | — | `{status, ollama_host, ollama_model}` | [main.py:34](../../backend/app/main.py#L34) |
+| `POST` | `/chat` | `ChatRequest` | `ChatResponse` | Non-streaming. Routes through `run_turn` with no-op callbacks; approvals auto-denied (the HTTP path can't prompt the user). |
+| `POST` | `/chat/reset` | `ResetRequest` | `ResetResponse` | Drop a conversation from the buffer. |
+| `WS` | `/chat/stream` | (frames) | (frames) | The main entry point. |
+| `GET` | `/health` | — | `{status, ollama_host, ollama_model}` | [main.py](../../backend/app/main.py) |
 
 ### `_build_messages()` and `_persist_turn()`
 
-Two tiny helpers used by both the HTTP and WS handlers. [`_build_messages`](../../backend/app/api/chat.py#L46) prepends `{"role":"system", "content": system_prompt()}` (re-read fresh — see [§9](#9-prompt-assembly)), spreads the history out as `{role, content}` dicts, and appends the new user turn. [`_persist_turn`](../../backend/app/api/chat.py#L54) appends the user message *and* the assistant reply to the buffer in one go.
+Two tiny helpers used by both the HTTP and WS handlers. [`_build_messages`](../../backend/app/api/chat.py) prepends `LLMMessage(role="system", content=system_prompt())` (re-read fresh — see [§10](#10-prompt-assembly)), spreads the history out as `LLMMessage` objects, and appends the new user turn. [`_persist_turn`](../../backend/app/api/chat.py) appends the user message *and* the assistant reply to the buffer in one go (still using the lighter `Message` type from `memory/buffer.py`).
 
-### `device_options()`
+### `_provider()`
 
-Lives in [config.py](../../backend/app/config.py) and is shared by both the `POST /chat` handler and the agent loop. Translates `PA_OLLAMA_DEVICE` into an Ollama `options` dict:
+A lazy `@lru_cache` singleton over [`get_provider()`](../../backend/app/llm/__init__.py) so the same adapter instance is reused for the process lifetime. The factory dispatches on `PA_LLM_PROVIDER` and imports the chosen adapter lazily — the unused SDKs never run their import-time code.
 
-| `PA_OLLAMA_DEVICE` | Returns | Effect |
-|---|---|---|
-| `auto` (default) | `None` | Ollama decides |
-| `cpu` | `{"num_gpu": 0}` | Force CPU-only |
-| `gpu` | `{"num_gpu": 999}` | Full offload (Ollama clamps to actual layer count) |
+Provider-specific options (Ollama's `num_ctx` / `num_gpu` / `think`, Anthropic's `max_tokens`, OpenAI's `stream_options`) are read inside the adapter, **not** in the chat handler. The handler only knows about `LLMMessage` and `Tool`. See [§7](#7-llm-providers) for the per-adapter translation details and [§11](#11-configuration) for the env-var matrix.
 
 ### WebSocket connection state
 
@@ -183,11 +236,11 @@ stateDiagram-v2
     closed --> [*]
 ```
 
-While in `awaiting_approval`, any frame whose `type ≠ "approval_response"` or whose `call_id` doesn't match is logged and discarded ([chat.py:161-170](../../backend/app/api/chat.py#L161-L170)). The UI disables the composer while a turn is in flight, so this discard branch is defensive.
+While in `awaiting_approval`, any frame whose `type ≠ "approval_response"` or whose `call_id` doesn't match is logged and discarded ([chat.py:154-163](../../backend/app/api/chat.py#L154-L163)). The UI disables the composer while a turn is in flight, so this discard branch is defensive.
 
 ### Callback wiring (`on_event`, `request_approval`)
 
-The WS handler defines two closures per turn ([chat.py:146-170](../../backend/app/api/chat.py#L146-L170)) and passes them into the agent loop. The loop knows nothing about WebSockets — it just calls the callbacks. This makes `run_turn()` trivially testable with plain async fakes; see [docs/learnings/agent-loop-architecture.md](../learnings/agent-loop-architecture.md).
+The WS handler defines two closures per turn ([chat.py:139-163](../../backend/app/api/chat.py#L139-L163)) and passes them into the agent loop. The loop knows nothing about WebSockets — it just calls the callbacks. This makes `run_turn()` trivially testable with plain async fakes; see [docs/learnings/agent-loop-architecture.md](../learnings/agent-loop-architecture.md).
 
 ```python
 async def on_event(frame: dict) -> None:
@@ -206,7 +259,7 @@ async def request_approval(call_id: str, name: str, args: dict) -> bool:
 
 ## 4. Frame protocol (WebSocket)
 
-The complete contract for `WS /chat/stream`. Defined in code at [chat.py:113-127](../../backend/app/api/chat.py#L113-L127); duplicated here in tabular form.
+The complete contract for `WS /chat/stream`. Defined in code at [chat.py:106-120](../../backend/app/api/chat.py#L106-L120); duplicated here in tabular form.
 
 ### Server → Client
 
@@ -219,7 +272,7 @@ The complete contract for `WS /chat/stream`. Defined in code at [chat.py:113-127
 | `done` | — | Turn completed successfully | `{"type":"done","conversation_id":"c-…"}` |
 | `error` | `error: str` | Loop raised `AgentError` or an unhandled exception | `{"type":"error","error":"agent exceeded MAX_STEPS=8…","conversation_id":"c-…"}` |
 
-Every server frame carries `conversation_id` — added by `on_event` in the spread `{**frame, "conversation_id": …}` ([chat.py:147](../../backend/app/api/chat.py#L147)).
+Every server frame carries `conversation_id` — added by `on_event` in the spread `{**frame, "conversation_id": …}` ([chat.py:140](../../backend/app/api/chat.py#L140)).
 
 ### Client → Server
 
@@ -247,57 +300,69 @@ Per ADR [0002](../decisions/0002-chat-transport.md) §"Versioning": the discrimi
 
 ### `run_turn()` — the algorithm
 
-Pseudocode (real implementation at [loop.py:74-197](../../backend/app/agent/loop.py#L74-L197)):
+Pseudocode (real implementation at [loop.py](../../backend/app/agent/loop.py)):
 
 ```python
-msgs = list(base_messages)
-tool_specs = ollama_tool_specs()
+msgs: list[LLMMessage] = list(base_messages)
+tools = list(TOOLS.values())
 consecutive_errors, last_failed_tool = 0, None
 
 for step in range(MAX_STEPS):
-    stream = client.chat(model, msgs, tools=tool_specs, stream=True, think=…)
+    content_chunks, final_tool_calls, usage = [], [], None
 
-    content_chunks, final_tool_calls = [], []
-    async for chunk in stream:
-        if chunk.message.content:
-            content_chunks.append(chunk.message.content)
-            await on_event({"type": "token", "delta": chunk.message.content})
-        if chunk.message.tool_calls:
-            final_tool_calls = list(chunk.message.tool_calls)   # last one wins
+    async for chunk in provider.chat_stream(msgs, tools):
+        if chunk.delta_text:
+            content_chunks.append(chunk.delta_text)
+            await on_event({"type": "token", "delta": chunk.delta_text})
+        if chunk.done:
+            if chunk.tool_calls:
+                final_tool_calls = chunk.tool_calls
+            usage = chunk.usage
+
+    # Aggregate stats across iterations
+    if usage is not None:
+        total_eval_tokens   += usage.completion_tokens
+        total_prompt_tokens += usage.prompt_tokens
+        total_eval_ns       += usage.duration_ns or 0
+        model_calls += 1
 
     content = "".join(content_chunks)
     if not final_tool_calls:
-        return content                                          # done
+        return content, _make_stats(...)                          # done
 
-    msgs.append({"role": "assistant", "content": content,
-                 "tool_calls": [tc.model_dump() for tc in final_tool_calls]})
+    msgs.append(LLMMessage(role="assistant", content=content,
+                           tool_calls=final_tool_calls))
 
     for tc in final_tool_calls:
-        name, args = tc.function.name, dict(tc.function.arguments or {})
         call_id = f"call_{uuid.uuid4().hex[:12]}"
-        await on_event({"type": "tool_call", "call_id": call_id, "name": name, "args": args})
-        ok, result = await _dispatch_tool(name, args, call_id=call_id, request_approval=…)
+        await on_event({"type": "tool_call", "call_id": call_id,
+                        "name": tc.name, "args": tc.arguments})
+        ok, result = await _dispatch_tool(tc.name, tc.arguments,
+                                          call_id=call_id, request_approval=…)
         await on_event({"type": "tool_result", "call_id": call_id, "ok": ok,
                         "preview": _preview(result)})
         if ok:
             consecutive_errors, last_failed_tool = 0, None
         else:
-            consecutive_errors = consecutive_errors + 1 if last_failed_tool == name else 1
-            last_failed_tool = name
+            consecutive_errors = consecutive_errors + 1 if last_failed_tool == tc.name else 1
+            last_failed_tool = tc.name
             if consecutive_errors > MAX_RETRIES_PER_TOOL:
                 raise AgentError(...)
-        msgs.append({"role": "tool", "content": result})        # full text, not preview
+        # tc.id threads back via tool_call_id so Anthropic/OpenAI can correlate;
+        # Ollama ignores it (its wire format doesn't use ids).
+        msgs.append(LLMMessage(role="tool", content=result, tool_call_id=tc.id))
 
 raise AgentError(f"exceeded MAX_STEPS={MAX_STEPS}")
 ```
 
 A few details worth knowing before changing this:
 
-- **Streaming is unconditional.** Even with `tools=[…]` available, we stream and forward tokens. `tool_calls` arrive complete in a late chunk (probed against `qwen3.5:4b` — see [docs/learnings/streaming-with-tools.md](../learnings/streaming-with-tools.md)). If a future Ollama version splits them across chunks, the "last one wins" assignment is the spot to revisit ([loop.py:122](../../backend/app/agent/loop.py#L122)).
-- **The assistant turn is built by hand.** When tools are involved we don't have a single `Message` object to `model_dump()` — we construct the dict explicitly with `content + tool_calls` ([loop.py:139-145](../../backend/app/agent/loop.py#L139-L145)). Easy to forget.
-- **Model sees full results, UI sees previews.** The `preview` field on `tool_result` is truncated by `_preview(text, n=500)` ([loop.py:33](../../backend/app/agent/loop.py#L33)); the full text goes back to the model ([loop.py:193](../../backend/app/agent/loop.py#L193)).
-- **Retries are per-tool.** A different tool's failure resets the counter ([loop.py:181-185](../../backend/app/agent/loop.py#L181-L185)).
-- **Approval denial is not an error.** `_dispatch_tool` returns `(ok=True, "User denied this action.")` so the model can adapt without burning a retry slot ([loop.py:55-58](../../backend/app/agent/loop.py#L55-L58)).
+- **Provider-agnostic.** The loop reads `chunk.delta_text` / `chunk.tool_calls` / `chunk.usage` — never anything Ollama-specific. The Ollama, Anthropic, and OpenAI adapters all yield `LLMChunk` with the same invariants (see [§7](#7-llm-providers)).
+- **Streaming is unconditional.** Even with `tools=[…]` available, we stream and forward tokens. `tool_calls` arrive complete on the final chunk (the adapter's job — see [docs/learnings/streaming-with-tools.md](../learnings/streaming-with-tools.md)). The loop simply reads `chunk.tool_calls` when `chunk.done is True`.
+- **`tool_call_id` threads end-to-end.** Each `LLMToolCall` has an `id`. When the loop builds the tool-result message it sets `tool_call_id=tc.id`. Anthropic and OpenAI require this for correlation; Ollama ignores it.
+- **Model sees full results, UI sees previews.** The `preview` field on `tool_result` is truncated by `_preview(text, n=500)`; the full text goes back to the model in the next `LLMMessage(role="tool", content=result)`.
+- **Retries are per-tool.** A different tool's failure resets the counter.
+- **Approval denial is not an error.** `_dispatch_tool` returns `(ok=True, "User denied this action.")` so the model can adapt without burning a retry slot.
 
 ### `_dispatch_tool()` decision table
 
@@ -320,18 +385,18 @@ sequenceDiagram
     participant UI as Browser UI
     participant API as WS handler
     participant RunTurn as run_turn()
-    participant Ollama
+    participant LLM as LLMProvider
     participant Buf as buffer
 
     UI->>API: {cid, message}
     API->>RunTurn: run_turn(base_msgs, on_event, request_approval)
-    RunTurn->>Ollama: chat(stream=True, tools=[...])
+    RunTurn->>LLM: chat_stream(messages, tools)
     loop streaming
-        Ollama-->>RunTurn: chunk(content)
+        LLM-->>RunTurn: LLMChunk(delta_text)
         RunTurn->>API: on_event({type:"token", delta})
         API-->>UI: token frame
     end
-    Ollama-->>RunTurn: chunk(done, no tool_calls)
+    LLM-->>RunTurn: LLMChunk(done=True, tool_calls=None, usage)
     RunTurn-->>API: return content
     API->>Buf: append(user, assistant)
     API-->>UI: {type:"done", cid}
@@ -347,12 +412,12 @@ sequenceDiagram
     participant RunTurn as run_turn()
     participant Disp as _dispatch_tool()
     participant Tool as write_file()
-    participant Ollama
+    participant LLM as LLMProvider
 
     UI->>API: {cid, "save a note"}
     API->>RunTurn: run_turn(...)
-    RunTurn->>Ollama: chat(stream=True, tools=[...])
-    Ollama-->>RunTurn: stream<br/>(some content)<br/>+ tool_calls=[write_file{...}]
+    RunTurn->>LLM: chat_stream(messages, tools)
+    LLM-->>RunTurn: text deltas, then<br/>LLMChunk(done=True,<br/>tool_calls=[write_file{...}])
     RunTurn->>API: on_event(token...) (during stream)
     RunTurn->>API: on_event({tool_call, call_id, name, args})
     API-->>UI: tool_call frame
@@ -368,13 +433,13 @@ sequenceDiagram
     RunTurn->>API: on_event({tool_result, call_id, ok, preview})
     API-->>UI: tool_result frame
     Note over RunTurn: append {"role":"tool", content:full}<br/>loop again
-    RunTurn->>Ollama: chat(stream=True, tools=[...])
+    RunTurn->>LLM: chat_stream(messages, tools)
     loop streaming
-        Ollama-->>RunTurn: chunk(content)
+        LLM-->>RunTurn: LLMChunk(delta_text)
         RunTurn->>API: on_event(token)
         API-->>UI: token frame
     end
-    Ollama-->>RunTurn: chunk(done, no tool_calls)
+    LLM-->>RunTurn: LLMChunk(done=True, tool_calls=None, usage)
     RunTurn-->>API: return content
     API-->>UI: {type:"done", cid}
 ```
@@ -387,7 +452,7 @@ sequenceDiagram
     participant RunTurn as run_turn()
     participant Disp as _dispatch_tool()
     participant Tool as read_file()
-    participant Ollama
+    participant LLM as LLMProvider
 
     Note over RunTurn: consecutive_errors=0
     RunTurn->>Disp: read_file(path="missing.txt")
@@ -395,14 +460,14 @@ sequenceDiagram
     Tool--xDisp: FileNotFoundError
     Disp-->>RunTurn: (False, "FileNotFoundError: no such file: missing.txt")
     Note over RunTurn: counter → 1<br/>(MAX_RETRIES=2, allowed)
-    RunTurn->>Ollama: chat(...)<br/>(model sees error)
-    Ollama-->>RunTurn: tool_calls=[read_file(path="still-missing.txt")]
+    RunTurn->>LLM: chat_stream(...)<br/>(model sees error)
+    LLM-->>RunTurn: LLMChunk(done=True,<br/>tool_calls=[read_file(path="still-missing.txt")])
     RunTurn->>Disp: read_file(...)
     Tool--xDisp: FileNotFoundError
     Disp-->>RunTurn: (False, "...")
     Note over RunTurn: counter → 2 (still allowed)
-    RunTurn->>Ollama: chat(...)
-    Ollama-->>RunTurn: tool_calls=[read_file(path="nope.txt")]
+    RunTurn->>LLM: chat_stream(...)
+    LLM-->>RunTurn: LLMChunk(done=True,<br/>tool_calls=[read_file(path="nope.txt")])
     RunTurn->>Disp: read_file(...)
     Disp-->>RunTurn: (False, "...")
     Note over RunTurn: counter → 3 > MAX_RETRIES_PER_TOOL=2
@@ -428,17 +493,18 @@ sequenceDiagram
 
 ## 6. Tool registry
 
-**File**: [backend/app/tools/registry.py](../../backend/app/tools/registry.py) · **ADR**: [0003 §3](../decisions/0003-agent-loop.md)
+**File**: [backend/app/tools/registry.py](../../backend/app/tools/registry.py) · **ADRs**: [0003 §3](../decisions/0003-agent-loop.md), [0007](../decisions/0007-llm-provider-abstraction.md)
 
-A dict, not a framework. The whole module is 47 lines.
+A dict, not a framework. The registry holds canonical `Tool` records and exposes three per-provider formatters that wrap the canonical JSON Schema in whichever envelope the provider expects.
 
 ```mermaid
 classDiagram
     class Tool {
         <<frozen dataclass>>
         +name: str
+        +description: str
+        +parameters: dict
         +fn: async (...) -> str
-        +schema: dict
         +requires_approval: bool
     }
 
@@ -446,50 +512,182 @@ classDiagram
         <<dict[str, Tool]>>
     }
 
-    class read_file_tool {
-        name = "read_file"
-        fn = read_file
-        schema = READ_FILE_SCHEMA
-        requires_approval = false
-    }
-    class write_file_tool {
-        name = "write_file"
-        fn = write_file
-        schema = WRITE_FILE_SCHEMA
-        requires_approval = true
-    }
-    class web_search_tool {
-        name = "web_search"
-        fn = web_search
-        schema = WEB_SEARCH_SCHEMA
-        requires_approval = false
+    class registry {
+        <<module>>
+        +ollama_tool_specs(tools) list~dict~
+        +openai_tool_specs(tools) list~dict~
+        +anthropic_tool_specs(tools) list~dict~
     }
 
-    TOOLS --> read_file_tool
-    TOOLS --> write_file_tool
-    TOOLS --> web_search_tool
-    read_file_tool --|> Tool
-    write_file_tool --|> Tool
-    web_search_tool --|> Tool
+    TOOLS --> Tool : 5× concrete tools
+    registry ..> TOOLS
 ```
 
-`ollama_tool_specs()` ([registry.py:45](../../backend/app/tools/registry.py#L45)) is the single export the loop needs — a list of the `schema` dicts ready to pass to `client.chat(tools=...)`.
+Each tool module ([read_file.py](../../backend/app/tools/read_file.py) etc.) exposes three module-level constants — `NAME`, `DESCRIPTION`, `PARAMETERS` (the inner JSON Schema) — plus the async `fn`. The registry's `_make()` helper builds a `Tool` from those.
+
+### Per-provider formatters
+
+| Function | Envelope shape |
+|---|---|
+| `ollama_tool_specs(tools)` | `{"type": "function", "function": {"name", "description", "parameters"}}` |
+| `openai_tool_specs(tools)` | Wire-identical to Ollama's (separate function so the two can drift later) |
+| `anthropic_tool_specs(tools)` | `{"name", "description", "input_schema"}` (Anthropic's flatter shape) |
+
+The agent loop hands the canonical `list[Tool]` straight to `provider.chat_stream(...)`; the adapter calls its own formatter internally. Loop code never sees the wrapped shapes.
 
 ### Adding a tool
 
 Three steps, no decorators:
 
-1. Create `backend/app/tools/<your_tool>.py` with an async `fn(**kwargs) -> str` and a module-level `SCHEMA: dict` (use [read_file.py](../../backend/app/tools/read_file.py) as the template — Ollama's expected JSON-schema shape is `{"type":"function","function":{"name","description","parameters"}}`).
-2. Import both in [registry.py](../../backend/app/tools/registry.py) and add an entry to `TOOLS` with the right `requires_approval`.
+1. Create `backend/app/tools/<your_tool>.py` with an async `fn(**kwargs) -> str` and three module-level constants: `NAME: str`, `DESCRIPTION: str`, `PARAMETERS: dict` (the inner JSON Schema — `{"type": "object", "properties": ..., "required": [...]}`). Use [read_file.py](../../backend/app/tools/read_file.py) as the template.
+2. Import the module in [registry.py](../../backend/app/tools/registry.py) and add an entry to `TOOLS` via the `_make()` helper with the right `requires_approval`.
 3. (Optional) Add a smoke test in `scripts/`.
 
-That's it. The loop picks it up via `ollama_tool_specs()` on the next turn.
+That's it. All three providers pick it up automatically — the formatters iterate `TOOLS.values()` on every turn.
 
 ---
 
-## 7. Tools and sandbox
+## 7. LLM providers
 
-**Files**: [tools/read_file.py](../../backend/app/tools/read_file.py), [tools/write_file.py](../../backend/app/tools/write_file.py), [tools/web_search.py](../../backend/app/tools/web_search.py), [tools/_sandbox.py](../../backend/app/tools/_sandbox.py)
+**Files**: [backend/app/llm/](../../backend/app/llm/) · **ADR**: [0007](../decisions/0007-llm-provider-abstraction.md)
+
+The seam between the agent loop and the actual LLM SDK. One `LLMProvider` Protocol ([base.py](../../backend/app/llm/base.py)) + three concrete adapters: Ollama (default), Anthropic, OpenAI. The factory `get_provider()` ([__init__.py](../../backend/app/llm/__init__.py)) dispatches on `PA_LLM_PROVIDER` and lazy-imports the chosen adapter so unused SDKs don't run their import-time code.
+
+### The contract
+
+Every adapter:
+
+1. Translates a `list[LLMMessage]` into its SDK's native message shape (and pulls its own knobs out of `Settings`).
+2. Streams the response, yielding `LLMChunk`s.
+3. Buffers any in-progress tool-call data internally so the loop only ever sees **complete** tool calls — on the **final** chunk, with `done=True` and `usage` populated.
+
+```mermaid
+classDiagram
+    class LLMProvider {
+        <<Protocol>>
+        +chat_stream(messages, tools) AsyncIterator~LLMChunk~
+    }
+    class OllamaProvider {
+        -_client: ollama.AsyncClient
+        +_to_ollama_messages(messages)
+        +chat_stream(messages, tools)
+    }
+    class AnthropicProvider {
+        -_client: anthropic.AsyncAnthropic
+        +_to_anthropic_messages(messages)$
+        +chat_stream(messages, tools)
+    }
+    class OpenAIProvider {
+        -_client: openai.AsyncOpenAI
+        +_to_openai_messages(messages)$
+        +chat_stream(messages, tools)
+    }
+    OllamaProvider ..|> LLMProvider
+    AnthropicProvider ..|> LLMProvider
+    OpenAIProvider ..|> LLMProvider
+```
+
+### Side-by-side translation table
+
+| Concern | Ollama | Anthropic | OpenAI |
+|---|---|---|---|
+| Tool spec shape | `{"type":"function","function":{...}}` | `{"name","description","input_schema"}` | Same as Ollama |
+| System prompt | First message with `role="system"` | Separate `system=` kwarg (not in the messages list) | First message with `role="system"` |
+| Assistant w/ tool_use | `{"role":"assistant","content":"...","tool_calls":[...]}` | `{"role":"assistant","content":[{"type":"text",...},{"type":"tool_use","id",...}]}` | `{"role":"assistant","content":"...","tool_calls":[{"id","type":"function","function":{"name","arguments":<json string>}}]}` |
+| Tool result | `{"role":"tool","content":"..."}` (no id) | One **user** message with `[{"type":"tool_result","tool_use_id",...}, ...]` per call (consecutive results fold into a single user turn) | `{"role":"tool","tool_call_id":"...","content":"..."}` |
+| Tool-call id | Synthesized `tc_0`, `tc_1` (Ollama has no native ids) | Server-generated `toolu_...` | Server-generated `call_...` |
+| Tool-call args | Streamed complete in one chunk's `message.tool_calls` (typically the final chunk) | `input_json_delta` fragments accumulated per content-block `index`, parsed at `content_block_stop` | Per-`index` JSON string fragments under `delta.tool_calls[].function.arguments`, concatenated then parsed at end of stream |
+| Usage on stream | Final chunk's `prompt_eval_count` / `eval_count` / `eval_duration` | `message_start` → `input_tokens`; `message_delta` → `output_tokens` | Trailing chunk with `choices=[]` carrying `usage` (requires `stream_options={"include_usage": True}`) |
+| `duration_ns` source | Real decode time from Ollama | Wall-clock around the stream (approximate) | Wall-clock around the stream (approximate) |
+| Required extras | None (uses `options={...}` from `Settings`) | `max_tokens` is required by the API | `stream_options={"include_usage": True}` |
+
+### Stream-event handling (per adapter)
+
+**Ollama** ([ollama.py](../../backend/app/llm/ollama.py))
+
+```
+for chunk in client.chat(stream=True, ...):
+    if chunk.message.content: yield LLMChunk(delta_text=...)
+    if chunk.message.tool_calls: remember as final list
+    if chunk.done: yield LLMChunk(done=True, tool_calls=final, usage=from chunk)
+```
+
+**Anthropic** ([anthropic.py](../../backend/app/llm/anthropic.py))
+
+| Event | Adapter action |
+|---|---|
+| `message_start` | Capture `usage.input_tokens` |
+| `content_block_start` (type=`tool_use`) | Allocate a buffer keyed by `event.index` with id+name |
+| `content_block_delta` (`text_delta`) | `yield LLMChunk(delta_text=delta.text)` immediately |
+| `content_block_delta` (`input_json_delta`) | Append `delta.partial_json` to the buffer at `event.index` |
+| `content_block_stop` | Parse buffered JSON, push `LLMToolCall` onto `completed[]` |
+| `message_delta` | Capture `usage.output_tokens` |
+| (stream ends) | `yield LLMChunk(done=True, tool_calls=completed, usage=...)` |
+
+**OpenAI** ([openai.py](../../backend/app/llm/openai.py))
+
+| Chunk shape | Adapter action |
+|---|---|
+| `choices[0].delta.content` non-empty | `yield LLMChunk(delta_text=...)` |
+| `choices[0].delta.tool_calls[i]` with `id`/`name` | Initialise per-`index` buffer |
+| `choices[0].delta.tool_calls[i]` with `function.arguments` fragment | Append fragment to that buffer |
+| `chunk.usage` non-None (trailing `choices=[]` chunk) | Capture `prompt_tokens` / `completion_tokens` |
+| (stream ends) | Parse each buffer's JSON, `yield LLMChunk(done=True, tool_calls=all_buffers, usage=...)` |
+
+### Sequence diagram — tool turn under Anthropic
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Loop as run_turn()
+    participant Adapter as AnthropicProvider
+    participant SDK as anthropic SDK
+    participant API as api.anthropic.com
+
+    Loop->>Adapter: chat_stream(messages, tools)
+    Adapter->>Adapter: _to_anthropic_messages()<br/>(pull system, build content blocks,<br/>fold consecutive tool messages)
+    Adapter->>SDK: messages.create(stream=True, ...)
+    SDK->>API: HTTPS request
+    API-->>SDK: SSE event stream
+    loop streaming
+        SDK-->>Adapter: RawMessageStartEvent (usage.input_tokens)
+        SDK-->>Adapter: RawContentBlockStartEvent (tool_use, id, name)
+        Note over Adapter: alloc buffer[index]
+        SDK-->>Adapter: RawContentBlockDeltaEvent (input_json_delta "...")
+        Note over Adapter: append to buffer
+        SDK-->>Adapter: RawContentBlockDeltaEvent (input_json_delta "...")
+        SDK-->>Adapter: RawContentBlockStopEvent
+        Note over Adapter: parse JSON, push LLMToolCall
+        SDK-->>Adapter: RawMessageDeltaEvent (usage.output_tokens)
+        SDK-->>Adapter: RawMessageStopEvent
+    end
+    Adapter-->>Loop: LLMChunk(done=True,<br/>tool_calls=[...], usage=...)
+```
+
+### Factory and lazy imports
+
+```python
+def get_provider() -> LLMProvider:
+    s = get_settings()
+    match s.llm_provider:
+        case "ollama":    from .ollama    import OllamaProvider;    return OllamaProvider(s)
+        case "anthropic": from .anthropic import AnthropicProvider; return AnthropicProvider(s)
+        case "openai":    from .openai    import OpenAIProvider;    return OpenAIProvider(s)
+```
+
+Each adapter's `__init__` reads its own subset of `Settings`. Anthropic and OpenAI adapters raise `RuntimeError` if the corresponding API key is empty so the failure mode is loud, at process start, not on the first chat turn.
+
+### Open questions / regression surface
+
+- **Anthropic conversation invariants.** Empty text blocks are rejected; consecutive `tool_result` blocks must fold into one user turn; `user` / `assistant` must alternate. The adapter handles the obvious cases but exotic shapes (e.g. assistant turn 1 with tool_use, turn 2 with text only and no tools) may surface 400s.
+- **Cloud `duration_ns` is wall-clock.** The per-turn tokens/sec figure is therefore not directly comparable across providers — fine for now, would matter for a comparison view.
+- **JSON-fragment robustness.** Both cloud adapters fall back to `arguments = {}` on `json.JSONDecodeError`. The model's tool call will then likely fail with an "argument error", which the loop feeds back so the model can self-correct. We've not seen this happen in practice; if it becomes common, the right fix is to surface the raw partial JSON in the error message.
+
+---
+
+## 8. Tools and sandbox
+
+**Files**: [tools/read_file.py](../../backend/app/tools/read_file.py), [tools/write_file.py](../../backend/app/tools/write_file.py), [tools/list_files.py](../../backend/app/tools/list_files.py), [tools/web_search.py](../../backend/app/tools/web_search.py), [tools/fetch_url.py](../../backend/app/tools/fetch_url.py), [tools/_sandbox.py](../../backend/app/tools/_sandbox.py)
 
 ### `read_file` ([read_file.py](../../backend/app/tools/read_file.py))
 
@@ -554,11 +752,11 @@ Why `Path.resolve()` first: it collapses `..` and follows symlinks, so the conta
 
 ---
 
-## 8. Memory — short-term ring buffer
+## 9. Memory — short-term ring buffer
 
 **File**: [backend/app/memory/buffer.py](../../backend/app/memory/buffer.py) · **ADR**: [0001](../decisions/0001-tech-stack.md)
 
-40 lines. Per-conversation `deque(maxlen=32)`, keyed in a dict. No persistence — Phase 3 introduces SQLite for long-term memory ([§13 below](#13-phase-3-long-term-memory-planned)).
+40 lines. Per-conversation `deque(maxlen=32)`, keyed in a dict. No persistence — Phase 3 introduces SQLite for long-term memory ([§14 below](#14-phase-3-long-term-memory-planned)).
 
 ### API
 
@@ -579,7 +777,7 @@ Module-level singleton `buffer = ConversationBuffer()` ([buffer.py:40](../../bac
 
 ---
 
-## 9. Prompt assembly
+## 10. Prompt assembly
 
 **File**: [backend/app/agent/prompt.py](../../backend/app/agent/prompt.py)
 
@@ -599,19 +797,48 @@ The cost is one small file read per turn (negligible). The benefit is rapid iter
 
 ---
 
-## 10. Configuration
+## 11. Configuration
 
 **File**: [backend/app/config.py](../../backend/app/config.py)
 
 `pydantic-settings`-based. Values come from process env vars (prefixed `PA_`) or a `.env` at the repo root. Singleton via `@lru_cache get_settings()`. Read-once at startup.
 
+### LLM backend selection ([ADR 0007](../decisions/0007-llm-provider-abstraction.md))
+
 | Setting (Python) | Env var | Default | Used by |
 |---|---|---|---|
-| `ollama_host` | `PA_OLLAMA_HOST` | `http://localhost:11434` | `chat._client()`, `/health` |
-| `ollama_model` | `PA_OLLAMA_MODEL` | `qwen3.5:4b` | `chat`, `loop` |
-| `ollama_think` | `PA_OLLAMA_THINK` | `false` | `chat`, `loop` (Qwen3's reasoning mode) |
-| `ollama_device` | `PA_OLLAMA_DEVICE` | `auto` | `config.device_options()` — used by both `POST /chat` and the agent loop |
-| `request_timeout_s` | `PA_REQUEST_TIMEOUT_S` | `60.0` | Per-chunk idle timeout for streaming Ollama calls |
+| `llm_provider` | `PA_LLM_PROVIDER` | `ollama` | `llm.get_provider()` — chooses adapter class |
+
+### Ollama (active when `llm_provider="ollama"`)
+
+| Setting (Python) | Env var | Default | Used by |
+|---|---|---|---|
+| `ollama_host` | `PA_OLLAMA_HOST` | `http://localhost:11434` | `OllamaProvider`, `/health` |
+| `ollama_model` | `PA_OLLAMA_MODEL` | `qwen3.5:4b` | `OllamaProvider` |
+| `ollama_think` | `PA_OLLAMA_THINK` | `false` | `OllamaProvider` (Qwen3's reasoning mode) |
+| `ollama_device` | `PA_OLLAMA_DEVICE` | `auto` | `config.ollama_options()` — read by `OllamaProvider` |
+| `ollama_num_ctx` | `PA_OLLAMA_NUM_CTX` | `32768` | `config.ollama_options()` |
+| `request_timeout_s` | `PA_REQUEST_TIMEOUT_S` | `60.0` | Per-chunk idle timeout on the Ollama HTTP stream |
+
+### Anthropic (active when `llm_provider="anthropic"`)
+
+| Setting (Python) | Env var | Default | Used by |
+|---|---|---|---|
+| `anthropic_api_key` | `PA_ANTHROPIC_API_KEY` | `""` (required) | `AnthropicProvider.__init__` — raises if empty |
+| `anthropic_model` | `PA_ANTHROPIC_MODEL` | `claude-haiku-4-5` | `AnthropicProvider` |
+| `anthropic_max_tokens` | `PA_ANTHROPIC_MAX_TOKENS` | `4096` | `AnthropicProvider` — required by the Messages API |
+
+### OpenAI (active when `llm_provider="openai"`)
+
+| Setting (Python) | Env var | Default | Used by |
+|---|---|---|---|
+| `openai_api_key` | `PA_OPENAI_API_KEY` | `""` (required) | `OpenAIProvider.__init__` — raises if empty |
+| `openai_model` | `PA_OPENAI_MODEL` | `gpt-4o-mini` | `OpenAIProvider` |
+
+### Agent loop + logging
+
+| Setting (Python) | Env var | Default | Used by |
+|---|---|---|---|
 | `agent_sandbox` | `PA_AGENT_SANDBOX` | `sandbox` | `_sandbox.sandbox_root()` |
 | `agent_max_steps` | `PA_AGENT_MAX_STEPS` | `8` | `loop.run_turn()` |
 | `agent_max_retries_per_tool` | `PA_AGENT_MAX_RETRIES_PER_TOOL` | `2` | `loop.run_turn()` |
@@ -619,11 +846,13 @@ The cost is one small file read per turn (negligible). The benefit is rapid iter
 | `log_dir` | `PA_LOG_DIR` | `logs` | `logging_config` |
 | `log_level` | `PA_LOG_LEVEL` | `INFO` | `logging_config` |
 
-Type aliases: `Device = Literal["auto", "cpu", "gpu"]` ([config.py:7](../../backend/app/config.py#L7)).
+Type aliases:
+- `Device = Literal["auto", "cpu", "gpu"]`
+- `LLMProviderName = Literal["ollama", "anthropic", "openai"]`
 
 ---
 
-## 11. Logging
+## 12. Logging
 
 **File**: [backend/app/logging_config.py](../../backend/app/logging_config.py) · **Called from**: [main.py:11](../../backend/app/main.py#L11)
 
@@ -648,7 +877,7 @@ Daily rotation produces `pa.log`, `pa.log.YYYY-MM-DD`, …; the oldest is droppe
 
 ---
 
-## 12. Frontend
+## 13. Frontend
 
 **File**: [frontend/src/App.tsx](../../frontend/src/App.tsx) · **Build**: [vite.config.ts](../../frontend/vite.config.ts) · **Lessons**: [docs/learnings/frontend.md](../learnings/frontend.md)
 
@@ -719,7 +948,7 @@ flowchart TB
 
 ---
 
-## 13. Phase 3 — long-term memory (planned)
+## 14. Phase 3 — long-term memory (planned)
 
 > All planned-phase sections below are **design intent**, not implemented behaviour. They will get LLD entries equal in detail once the code exists.
 
@@ -806,7 +1035,7 @@ Either an in-loop step (the agent itself emits facts via a `remember(text)` tool
 
 ---
 
-## 14. Phase 4 — voice I/O (planned)
+## 15. Phase 4 — voice I/O (planned)
 
 ### Topology
 
@@ -848,7 +1077,7 @@ Existing `token`, `tool_*`, `done`, `error` frames are unchanged.
 
 ---
 
-## 15. Phase 5 — calendar tools (planned)
+## 16. Phase 5 — calendar tools (planned)
 
 No structural change. Adds tool entries to `TOOLS`:
 
@@ -863,7 +1092,7 @@ A small `backend/app/integrations/calendar.py` holds the auth handshake and a cr
 
 ---
 
-## 16. Phase 6 — hot paths (planned)
+## 17. Phase 6 — hot paths (planned)
 
 Profile after Phase 4 lands. Likely candidates for FFI replacement:
 
@@ -877,7 +1106,7 @@ The pattern: pure-Python implementation stays as the fallback; the FFI version i
 
 ---
 
-## 17. Phase 7 — mobile (planned)
+## 18. Phase 7 — mobile (planned)
 
 Open question; revisit when the rest is solid. The three options and what each implies architecturally:
 
@@ -897,16 +1126,27 @@ The decision affects whether the backend remains "always-on at home, phone talks
 |---|---|---|
 | [backend/app/main.py](../../backend/app/main.py) | ~42 | FastAPI app, CORS, `/health`, router mount |
 | [backend/app/api/chat.py](../../backend/app/api/chat.py) | ~215 | HTTP + WS endpoints, frame protocol |
-| [backend/app/agent/loop.py](../../backend/app/agent/loop.py) | ~198 | `run_turn()`, `_dispatch_tool()` |
+| [backend/app/agent/loop.py](../../backend/app/agent/loop.py) | ~235 | `run_turn()`, `_dispatch_tool()` (provider-agnostic) |
 | [backend/app/agent/prompt.py](../../backend/app/agent/prompt.py) | ~10 | `system_prompt()` (SOUL.md hot-loader) |
-| [backend/app/tools/registry.py](../../backend/app/tools/registry.py) | ~54 | `Tool`, `TOOLS`, `ollama_tool_specs()` |
-| [backend/app/tools/read_file.py](../../backend/app/tools/read_file.py) | ~43 | read tool + schema |
-| [backend/app/tools/write_file.py](../../backend/app/tools/write_file.py) | ~38 | write tool + schema |
-| [backend/app/tools/web_search.py](../../backend/app/tools/web_search.py) | ~70 | DDG search via `ddgs` library + schema |
+| [backend/app/llm/__init__.py](../../backend/app/llm/__init__.py) | ~46 | `get_provider()` factory + public type re-exports |
+| [backend/app/llm/base.py](../../backend/app/llm/base.py) | ~73 | `LLMProvider` Protocol, `LLMMessage`, `LLMChunk`, `LLMToolCall`, `LLMUsage` |
+| [backend/app/llm/ollama.py](../../backend/app/llm/ollama.py) | ~105 | `OllamaProvider` — wraps `ollama.AsyncClient` |
+| [backend/app/llm/anthropic.py](../../backend/app/llm/anthropic.py) | ~185 | `AnthropicProvider` — content-block tool protocol, system pull-out |
+| [backend/app/llm/openai.py](../../backend/app/llm/openai.py) | ~145 | `OpenAIProvider` — indexed tool-call fragment assembly |
+| [backend/app/tools/registry.py](../../backend/app/tools/registry.py) | ~90 | `Tool` dataclass, `TOOLS`, three per-provider formatters |
+| [backend/app/tools/read_file.py](../../backend/app/tools/read_file.py) | ~37 | read tool + `NAME` / `DESCRIPTION` / `PARAMETERS` |
+| [backend/app/tools/write_file.py](../../backend/app/tools/write_file.py) | ~32 | write tool + `NAME` / `DESCRIPTION` / `PARAMETERS` |
+| [backend/app/tools/list_files.py](../../backend/app/tools/list_files.py) | ~87 | sandbox directory listing |
+| [backend/app/tools/web_search.py](../../backend/app/tools/web_search.py) | ~66 | DDG search via `ddgs` library |
+| [backend/app/tools/fetch_url.py](../../backend/app/tools/fetch_url.py) | ~145 | URL fetch + main-content extraction (approval-gated, public hosts only) |
 | [backend/app/tools/_sandbox.py](../../backend/app/tools/_sandbox.py) | ~37 | `safe_path()`, `sandbox_root()`, `SandboxError` |
 | [backend/app/memory/buffer.py](../../backend/app/memory/buffer.py) | ~41 | `Message`, `ConversationBuffer`, `buffer` singleton |
-| [backend/app/config.py](../../backend/app/config.py) | ~35 | `Settings`, `get_settings()` |
+| [backend/app/config.py](../../backend/app/config.py) | ~70 | `Settings`, `get_settings()`, `ollama_options()` |
 | [backend/app/logging_config.py](../../backend/app/logging_config.py) | ~57 | `configure_logging()` |
+| [backend/tests/test_agent_loop.py](../../backend/tests/test_agent_loop.py) | ~470 | Loop unit tests via `FakeProvider` |
+| [backend/tests/test_provider_ollama.py](../../backend/tests/test_provider_ollama.py) | ~165 | OllamaProvider chunk translation |
+| [backend/tests/test_provider_anthropic.py](../../backend/tests/test_provider_anthropic.py) | ~270 | AnthropicProvider message + event translation |
+| [backend/tests/test_provider_openai.py](../../backend/tests/test_provider_openai.py) | ~220 | OpenAIProvider fragment assembly |
 | [frontend/src/App.tsx](../../frontend/src/App.tsx) | ~375 | UI, WS client, frame reducer, `ToolCard` |
 | [frontend/vite.config.ts](../../frontend/vite.config.ts) | — | Dev proxy for `/chat` (ws) and `/health` |
-| [scripts/smoke_*.py](../../scripts/) | — | End-to-end test drivers (no UI required) |
+| [scripts/smoke_*.py](../../scripts/) | — | End-to-end test drivers (`smoke_provider.py` is provider-agnostic) |

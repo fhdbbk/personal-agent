@@ -40,28 +40,23 @@ TIMEOUT_S = 15.0
 IMPERSONATE = "chrome"             # primp browser fingerprint; "chrome" is well-supported
 
 
-SCHEMA: dict = {
-    "type": "function",
-    "function": {
-        "name": "fetch_url",
-        "description": (
-            "Fetch a web page over HTTP(S) and return its main text content "
-            "with boilerplate (nav, ads, footer) stripped. Use this after "
-            "web_search when a snippet is not enough — for example to read "
-            "the actual currency rate, weather details, or article body "
-            "behind a search result. Only http(s) URLs to public hosts."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "url": {
-                    "type": "string",
-                    "description": "Absolute http(s) URL to fetch.",
-                },
-            },
-            "required": ["url"],
+NAME = "fetch_url"
+DESCRIPTION = (
+    "Fetch a web page over HTTP(S) and return its main text content "
+    "with boilerplate (nav, ads, footer) stripped. Use this after "
+    "web_search when a snippet is not enough — for example to read "
+    "the actual currency rate, weather details, or article body "
+    "behind a search result. Only http(s) URLs to public hosts."
+)
+PARAMETERS: dict = {
+    "type": "object",
+    "properties": {
+        "url": {
+            "type": "string",
+            "description": "Absolute http(s) URL to fetch.",
         },
     },
+    "required": ["url"],
 }
 
 

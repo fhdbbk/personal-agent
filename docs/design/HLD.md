@@ -28,12 +28,14 @@ flowchart LR
     subgraph laptop ["Laptop (single host)"]
         ui["Browser UI<br/>(React + Vite)"]
         backend["Personal Assistant<br/>backend (FastAPI)"]
-        ollama["Ollama daemon<br/>(llama.cpp)"]
+        ollama["Ollama daemon<br/>(llama.cpp)<br/>— default LLM"]
         sandbox[("sandbox/<br/>filesystem")]
         logs[("logs/<br/>rotating files")]
         soul[("SOUL.md<br/>persona")]
     end
 
+    anthropic[("☁️ Anthropic API")]
+    openai[("☁️ OpenAI API")]
     web[("🌐 Web<br/>(Phase 2)")]
     cal[("📅 Calendar<br/>(Phase 5)")]
     mic(["🎤 Mic<br/>(Phase 4)"])
@@ -46,7 +48,9 @@ flowchart LR
     backend -.->|Phase 4| speaker
 
     ui <-- "WebSocket<br/>+ HTTP" --> backend
-    backend <-- "tool-aware chat" --> ollama
+    backend <-- "tool-aware chat<br/>(via LLMProvider)" --> ollama
+    backend <-. "PA_LLM_PROVIDER=anthropic" .-> anthropic
+    backend <-. "PA_LLM_PROVIDER=openai" .-> openai
     backend <-- "read/write" --> sandbox
     backend --> logs
     backend -- "hot-load on every turn" --> soul
@@ -54,10 +58,10 @@ flowchart LR
     backend -.->|Phase 5| cal
 
     classDef planned stroke-dasharray: 4 4,opacity:0.6;
-    class web,cal,mic,speaker planned
+    class web,cal,mic,speaker,anthropic,openai planned
 ```
 
-Solid lines are wired today (end of Phase 2). Dashed lines are planned.
+Solid lines are wired today (end of Phase 2). Dashed lines are either planned or runtime-selectable (the cloud LLM backends are wired but disabled by default; see [ADR 0007](../decisions/0007-llm-provider-abstraction.md)).
 
 ## 3. Component view
 
@@ -73,14 +77,22 @@ flowchart TB
 
     subgraph be ["Backend — FastAPI + uvicorn"]
         api["api/chat.py<br/>HTTP + WebSocket"]
-        loop["agent/loop.py<br/>ReAct loop"]
+        loop["agent/loop.py<br/>ReAct loop<br/>(provider-agnostic)"]
         prompt["agent/prompt.py<br/>SOUL.md hot-loader"]
-        registry["tools/registry.py<br/>Tool dataclass + dict"]
-        tools["read_file<br/>write_file<br/>(_sandbox.safe_path)"]
+        subgraph llm ["llm/ — provider abstraction (ADR 0007)"]
+            base["base.py<br/>LLMProvider Protocol<br/>+ normalized types"]
+            ollama_p["ollama.py"]
+            anthropic_p["anthropic.py"]
+            openai_p["openai.py"]
+        end
+        registry["tools/registry.py<br/>Tool + 3 formatters"]
+        tools["read_file<br/>write_file<br/>web_search<br/>fetch_url<br/>(_sandbox.safe_path)"]
         mem["memory/buffer.py<br/>ring buffer<br/>(Phase 3 → SQLite)"]
         cfg["config.py<br/>PA_* env vars"]
         log["logging_config.py<br/>rotating file"]
         api --> loop
+        api --> llm
+        loop --> llm
         loop --> registry
         loop --> prompt
         registry --> tools
@@ -88,22 +100,26 @@ flowchart TB
         api --> prompt
     end
 
-    subgraph ext ["External processes / files"]
+    subgraph ext ["External processes / files / APIs"]
         ollama["Ollama daemon"]
+        anth["Anthropic API"]
+        oai["OpenAI API"]
         sandbox[("sandbox/")]
         soulfile[("SOUL.md")]
         logfiles[("logs/pa.log*")]
     end
 
     fe <-- "WS frames<br/>+ HTTP JSON" --> api
-    loop -- "stream chat<br/>tools=[...]" --> ollama
-    api -- "POST /chat" --> ollama
+    ollama_p -- "stream chat<br/>tools=[...]" --> ollama
+    anthropic_p -. "PA_LLM_PROVIDER=anthropic" .-> anth
+    openai_p -. "PA_LLM_PROVIDER=openai" .-> oai
     tools --> sandbox
     prompt --> soulfile
     log --> logfiles
 
     cfg -.-> api
     cfg -.-> loop
+    cfg -.-> llm
     cfg -.-> tools
     cfg -.-> log
 ```
@@ -124,6 +140,9 @@ flowchart TB
 | Chat transport | **Long-lived WebSocket** with typed JSON frames | One handshake per session, multi-turn, easy to extend with new frame types | [0002](../decisions/0002-chat-transport.md) |
 | Agent loop shape | **Native Ollama tool-calling, sequential ReAct** | Use the model's structured output, not prompt-and-parse; one tool at a time | [0003](../decisions/0003-agent-loop.md) |
 | Streaming + tools | **Stream every iteration**; `tool_calls` finalise on the last chunk | Restores Phase 1's snappy UX without special-case branching | [0004](../decisions/0004-streaming-with-tools.md) |
+| `web_search` backend | **`ddgs`** library (browser-fingerprinted DDG) | Raw HTML scrape gets bot-blocked; ddgs handles fingerprinting + endpoint rotation | [0005](../decisions/0005-search-backend-ddgs.md) |
+| `fetch_url` tool | **`primp` + `trafilatura`**, approval-gated, public hosts only | Reuses primp from ddgs; trafilatura strips boilerplate; DNS pre-resolve rejects loopback/private | [0006](../decisions/0006-fetch-url-tool.md) |
+| LLM provider abstraction | **Hand-rolled `LLMProvider` Protocol**, normalised types, adapters for Ollama / Anthropic / OpenAI | Switch backends at runtime; prerequisite for hosting on a cloud VPS later | [0007](../decisions/0007-llm-provider-abstraction.md) |
 | Package manager | **uv** | Fast, single-binary, lockfile by default | [0001](../decisions/0001-tech-stack.md) |
 | Python | **3.12** | Pattern matching, `typing.Self`, `Path.is_relative_to` | [0001](../decisions/0001-tech-stack.md) |
 
@@ -134,7 +153,7 @@ The three flows below are the three "shapes" of a turn the system can take today
 **(a) Plain streaming chat — no tools**
 
 1. UI sends `{conversation_id, message}` over the WebSocket.
-2. Backend builds messages = `[system_prompt(), …history…, user_msg]` and calls `ollama.chat(stream=True, tools=[...])`.
+2. Backend builds messages = `[system_prompt(), …history…, user_msg]` (as `LLMMessage` objects) and calls `provider.chat_stream(messages, tools=[...])`. The configured provider — Ollama by default, optionally Anthropic / OpenAI — handles its own SDK call.
 3. Each non-empty content chunk is forwarded to the UI as a `token` frame.
 4. The stream ends with no `tool_calls`. The accumulated text is the final reply.
 5. Backend persists the user message + reply to the ring buffer and sends `done`.
@@ -149,13 +168,13 @@ The three flows below are the three "shapes" of a turn the system can take today
 
 **(c) Memory-augmented turn (Phase 3, planned)**
 
-A retrieval step slots in between "build messages" and "call Ollama": embed the user message, query SQLite for top-k relevant facts, prepend them as a system note. Everything downstream is unchanged. Sketch lives in [LLD §13](LLD.md#13-phase-3-long-term-memory-planned).
+A retrieval step slots in between "build messages" and "call the provider": embed the user message, query SQLite for top-k relevant facts, prepend them as a system note. Everything downstream is unchanged. Sketch lives in [LLD §14](LLD.md#14-phase-3-long-term-memory-planned).
 
 ## 6. Cross-cutting concerns
 
 ### Configuration
 
-All knobs are environment variables prefixed `PA_`, loaded by [pydantic-settings](https://docs.pydantic.dev/latest/concepts/pydantic_settings/) from the process environment or a `.env` at the repo root. Settings are read once at process start via an `@lru_cache` singleton — no hot reloads (except SOUL.md, see below). Full table in [LLD §10](LLD.md#10-configuration).
+All knobs are environment variables prefixed `PA_`, loaded by [pydantic-settings](https://docs.pydantic.dev/latest/concepts/pydantic_settings/) from the process environment or a `.env` at the repo root. Settings are read once at process start via an `@lru_cache` singleton — no hot reloads (except SOUL.md, see below). Full table in [LLD §11](LLD.md#11-configuration).
 
 ### Logging
 
@@ -178,6 +197,10 @@ The system prompt is **not a code constant**. [`system_prompt()`](../../backend/
 ### Approval gating
 
 Each `Tool` carries a `requires_approval: bool`. When set, the loop pauses, sends a `tool_approval` frame to the UI, and blocks on the matching `approval_response`. The UI renders inline Approve/Deny buttons on the tool card. Auto-approve is available via `PA_AGENT_AUTO_APPROVE=true` for headless smoke runs.
+
+### LLM provider selection
+
+The agent loop and chat endpoint talk to an `LLMProvider` ([backend/app/llm/base.py](../../backend/app/llm/base.py)) — a small Protocol with one method, `chat_stream(messages, tools) → AsyncIterator[LLMChunk]`. `PA_LLM_PROVIDER` picks the concrete adapter at startup: `ollama` (default, local-first), `anthropic` (cloud, content-block tool protocol), or `openai` (cloud, function tools). Provider-specific knobs (`PA_OLLAMA_THINK` / `_NUM_CTX`, `PA_ANTHROPIC_MAX_TOKENS`, etc.) live inside their respective adapters; only their selected adapter reads them. See [ADR 0007](../decisions/0007-llm-provider-abstraction.md) for the design rationale and [LLD §7](LLD.md#7-llm-providers) for the per-provider translation details.
 
 ## 7. Phased evolution
 
@@ -330,7 +353,12 @@ personal_assistant/
 ├── backend/app/
 │   ├── api/chat.py                # HTTP + WebSocket
 │   ├── agent/{loop,prompt}.py     # ReAct loop + SOUL.md loader
-│   ├── tools/                     # registry + read_file / write_file / web_search + _sandbox
+│   ├── llm/                       # LLMProvider abstraction (ADR 0007)
+│   │   ├── base.py                #   Protocol + normalized types
+│   │   ├── ollama.py              #   default; wraps ollama.AsyncClient
+│   │   ├── anthropic.py           #   cloud; Messages API content blocks
+│   │   └── openai.py              #   cloud; Chat Completions streaming
+│   ├── tools/                     # registry + read_file / write_file / web_search / fetch_url + _sandbox
 │   ├── memory/buffer.py           # in-process ring buffer
 │   ├── config.py                  # pydantic-settings
 │   ├── logging_config.py          # rotating file logger
@@ -338,7 +366,7 @@ personal_assistant/
 ├── frontend/                      # React + Vite + TS chat UI
 ├── sandbox/                       # gitignored; agent's read/write scope
 ├── logs/                          # gitignored; rotating logs
-├── scripts/                       # smoke_ollama, smoke_chat_ws*, smoke_agent
+├── scripts/                       # smoke_ollama, smoke_provider, smoke_chat_ws*, smoke_agent
 ├── docs/
 │   ├── decisions/                 # ADRs (immutable)
 │   ├── design/                    # this folder (living)

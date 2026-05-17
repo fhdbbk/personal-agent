@@ -3,17 +3,17 @@
 
 The loop is intentionally transport-agnostic — it talks to the WS
 handler through two callbacks (`on_event`, `request_approval`) and to
-Ollama through an `AsyncClient`. We fake all three here so the tests
-run without a live Ollama and cover paths that smoke scripts can't
-deterministically reach (max-step abort, repeated-failure abort,
-multi-call stats aggregation).
+the LLM through an `LLMProvider` (see [backend/app/llm/base.py]). We
+fake all three here so the tests run without a live LLM and cover paths
+that smoke scripts can't deterministically reach (max-step abort,
+repeated-failure abort, multi-call stats aggregation).
 """
 
 import pytest
-from ollama import ChatResponse, Message
 
 from backend.app.agent.loop import AgentError, run_turn
 from backend.app.config import get_settings
+from backend.app.llm.base import LLMChunk, LLMMessage, LLMToolCall, LLMUsage
 from backend.app.tools.registry import Tool
 
 
@@ -31,51 +31,68 @@ def _clear_settings_cache():
 
 def _chunk(
     content: str = "",
-    tool_calls: list | None = None,
+    tool_calls: list[LLMToolCall] | None = None,
     eval_count: int | None = None,
     eval_duration: int | None = None,
     prompt_eval_count: int | None = None,
-) -> ChatResponse:
-    """Build a ChatResponse like the ones Ollama streams. Stats fields
-    are populated only on the final chunk (`done=True`), so we treat
-    `eval_count is not None` as the done marker."""
-    msg = Message(role="assistant", content=content, tool_calls=tool_calls)
-    return ChatResponse(
-        message=msg,
-        eval_count=eval_count,
-        eval_duration=eval_duration,
-        prompt_eval_count=prompt_eval_count,
-        done=eval_count is not None,
+) -> LLMChunk:
+    """Build a normalized LLMChunk. Stats fields are populated only on
+    the final chunk (`done=True`); we treat `eval_count is not None` as
+    the done marker, matching how real provider adapters behave."""
+    is_final = eval_count is not None
+    usage = (
+        LLMUsage(
+            prompt_tokens=prompt_eval_count or 0,
+            completion_tokens=eval_count or 0,
+            duration_ns=eval_duration or 0,
+        )
+        if is_final
+        else None
+    )
+    return LLMChunk(
+        delta_text=content or None,
+        tool_calls=tool_calls if is_final else None,
+        done=is_final,
+        usage=usage,
     )
 
 
-def _tc(name: str, args: dict) -> dict:
-    """Tool-call payload for Message(tool_calls=...). Pydantic builds
-    the ToolCall from the dict shape."""
-    return {"function": {"name": name, "arguments": args}}
+def _tc(name: str, args: dict, id: str = "tc_test") -> LLMToolCall:
+    return LLMToolCall(id=id, name=name, arguments=args)
 
 
-class FakeClient:
-    """Stand-in for ollama.AsyncClient. Each entry of `iterations` is
-    the list of chunks the i-th call to `chat(...)` should yield."""
+def _stub_tool(name: str, fn, requires_approval: bool = False) -> Tool:
+    return Tool(
+        name=name,
+        description="",
+        parameters={},
+        fn=fn,
+        requires_approval=requires_approval,
+    )
 
-    def __init__(self, iterations: list[list[ChatResponse]]) -> None:
+
+class FakeProvider:
+    """Stand-in for an LLMProvider. Each entry of `iterations` is the
+    list of chunks the i-th call to `chat_stream(...)` should yield.
+
+    Implemented as an async generator method so `async for chunk in
+    provider.chat_stream(...)` in the loop works directly — no extra
+    `await` step. Real adapters (see backend/app/llm/ollama.py) follow
+    the same shape."""
+
+    def __init__(self, iterations: list[list[LLMChunk]]) -> None:
         self._iters = list(iterations)
-        self.calls: list[dict] = []  # captured kwargs of each chat() call
+        self.calls: list[dict] = []  # captured args of each chat_stream() call
 
-    async def chat(self, **kwargs):
-        self.calls.append(kwargs)
+    async def chat_stream(self, messages, tools):
+        self.calls.append({"messages": list(messages), "tools": list(tools)})
         if not self._iters:
             raise AssertionError(
-                "FakeClient exhausted: loop made more model calls than the test scripted"
+                "FakeProvider exhausted: loop made more model calls than the test scripted"
             )
         chunks = self._iters.pop(0)
-
-        async def gen():
-            for c in chunks:
-                yield c
-
-        return gen()
+        for c in chunks:
+            yield c
 
 
 class EventLog:
@@ -100,7 +117,7 @@ async def _deny(call_id, name, args) -> bool:
 
 
 async def test_no_tool_calls_returns_content_and_stats():
-    client = FakeClient(
+    provider = FakeProvider(
         [
             [
                 _chunk(content="hello "),
@@ -117,8 +134,8 @@ async def test_no_tool_calls_returns_content_and_stats():
 
     final, stats = await run_turn(
         conversation_id="c1",
-        base_messages=[{"role": "user", "content": "hi"}],
-        client=client,
+        base_messages=[LLMMessage(role="user", content="hi")],
+        provider=provider,
         on_event=events,
         request_approval=_allow,
     )
@@ -144,9 +161,9 @@ async def test_stats_sum_across_iterations(monkeypatch):
 
     monkeypatch.setattr(
         "backend.app.agent.loop.TOOLS",
-        {"echo": Tool(name="echo", fn=echo, schema={}, requires_approval=False)},
+        {"echo": _stub_tool("echo", echo)},
     )
-    client = FakeClient(
+    provider = FakeProvider(
         [
             # call 1: just a tool_call
             [
@@ -172,7 +189,7 @@ async def test_stats_sum_across_iterations(monkeypatch):
     final, stats = await run_turn(
         conversation_id="c1",
         base_messages=[],
-        client=client,
+        provider=provider,
         on_event=EventLog(),
         request_approval=_allow,
     )
@@ -194,11 +211,17 @@ async def test_tool_call_dispatch_emits_call_and_result_frames(monkeypatch):
 
     monkeypatch.setattr(
         "backend.app.agent.loop.TOOLS",
-        {"add": Tool(name="add", fn=add, schema={}, requires_approval=False)},
+        {"add": _stub_tool("add", add)},
     )
-    client = FakeClient(
+    provider = FakeProvider(
         [
-            [_chunk(tool_calls=[_tc("add", {"a": 2, "b": 3})])],
+            [
+                _chunk(
+                    tool_calls=[_tc("add", {"a": 2, "b": 3}, id="tc_42")],
+                    eval_count=0,
+                    eval_duration=0,
+                )
+            ],
             [
                 _chunk(
                     content="answer is 5",
@@ -213,7 +236,7 @@ async def test_tool_call_dispatch_emits_call_and_result_frames(monkeypatch):
     final, _ = await run_turn(
         conversation_id="c1",
         base_messages=[],
-        client=client,
+        provider=provider,
         on_event=events,
         request_approval=_allow,
     )
@@ -224,9 +247,13 @@ async def test_tool_call_dispatch_emits_call_and_result_frames(monkeypatch):
     tr = next(f for f in events.frames if f["type"] == "tool_result")
     assert tr["ok"] is True
     assert tr["preview"] == "5"
-    # The loop should also feed the tool result back into msgs for call 2.
-    second_msgs = client.calls[1]["messages"]
-    assert second_msgs[-1] == {"role": "tool", "content": "5"}
+    # The loop should also feed the tool result back into msgs for call 2,
+    # preserving the tool_call_id so cloud providers can correlate.
+    second_msgs = provider.calls[1]["messages"]
+    last = second_msgs[-1]
+    assert last.role == "tool"
+    assert last.content == "5"
+    assert last.tool_call_id == "tc_42"
 
 
 async def test_tool_bad_args_returns_argument_error(monkeypatch):
@@ -239,11 +266,17 @@ async def test_tool_bad_args_returns_argument_error(monkeypatch):
 
     monkeypatch.setattr(
         "backend.app.agent.loop.TOOLS",
-        {"add": Tool(name="add", fn=add, schema={}, requires_approval=False)},
+        {"add": _stub_tool("add", add)},
     )
-    client = FakeClient(
+    provider = FakeProvider(
         [
-            [_chunk(tool_calls=[_tc("add", {"a": 1})])],  # missing b
+            [
+                _chunk(
+                    tool_calls=[_tc("add", {"a": 1})],  # missing b
+                    eval_count=0,
+                    eval_duration=0,
+                )
+            ],
             [
                 _chunk(
                     content="let me retry",
@@ -258,7 +291,7 @@ async def test_tool_bad_args_returns_argument_error(monkeypatch):
     final, _ = await run_turn(
         conversation_id="c1",
         base_messages=[],
-        client=client,
+        provider=provider,
         on_event=events,
         request_approval=_allow,
     )
@@ -269,12 +302,12 @@ async def test_tool_bad_args_returns_argument_error(monkeypatch):
     assert "argument error" in tr["preview"].lower()
 
 
-async def test_client_chat_receives_options_and_tools_per_iteration():
-    """Plumbing check: run_turn must hand options (incl. num_ctx) and
-    tool specs to AsyncClient.chat on every iteration, and request
-    streaming. Catches regressions where one of these gets dropped on
-    the multi-iteration code path."""
-    client = FakeClient(
+async def test_provider_receives_messages_and_tools_per_iteration():
+    """Plumbing check: run_turn must hand `messages` and `tools` to the
+    provider on every iteration. Provider-specific knobs (Ollama options,
+    Anthropic max_tokens) live inside the provider now, so the loop
+    signature stays narrow — that's what we verify here."""
+    provider = FakeProvider(
         [
             [
                 _chunk(
@@ -288,28 +321,25 @@ async def test_client_chat_receives_options_and_tools_per_iteration():
 
     await run_turn(
         conversation_id="c1",
-        base_messages=[{"role": "user", "content": "hello"}],
-        client=client,
+        base_messages=[LLMMessage(role="user", content="hello")],
+        provider=provider,
         on_event=EventLog(),
         request_approval=_allow,
     )
 
-    assert len(client.calls) == 1
-    kwargs = client.calls[0]
-    assert kwargs["stream"] is True
-    assert kwargs["options"]["num_ctx"] == get_settings().ollama_num_ctx
-    assert "tools" in kwargs and isinstance(kwargs["tools"], list)
-    # System+history were forwarded as messages, not lost.
-    assert kwargs["messages"] == [{"role": "user", "content": "hello"}]
+    assert len(provider.calls) == 1
+    call = provider.calls[0]
+    assert call["messages"] == [LLMMessage(role="user", content="hello")]
+    assert isinstance(call["tools"], list)
 
 
 async def test_unknown_tool_emits_error_result_for_model(monkeypatch):
     """When the model hallucinates a tool name, the error gets fed
     back as a tool_result with ok=False so the model can self-correct."""
     monkeypatch.setattr("backend.app.agent.loop.TOOLS", {})
-    client = FakeClient(
+    provider = FakeProvider(
         [
-            [_chunk(tool_calls=[_tc("ghost", {})])],
+            [_chunk(tool_calls=[_tc("ghost", {})], eval_count=0, eval_duration=0)],
             [_chunk(content="ok I gave up", eval_count=1, eval_duration=1_000_000_000)],
         ]
     )
@@ -318,7 +348,7 @@ async def test_unknown_tool_emits_error_result_for_model(monkeypatch):
     final, _ = await run_turn(
         conversation_id="c1",
         base_messages=[],
-        client=client,
+        provider=provider,
         on_event=events,
         request_approval=_allow,
     )
@@ -338,15 +368,11 @@ async def test_approval_approved_runs_tool(monkeypatch):
 
     monkeypatch.setattr(
         "backend.app.agent.loop.TOOLS",
-        {
-            "dangerous": Tool(
-                name="dangerous", fn=dangerous, schema={}, requires_approval=True
-            )
-        },
+        {"dangerous": _stub_tool("dangerous", dangerous, requires_approval=True)},
     )
-    client = FakeClient(
+    provider = FakeProvider(
         [
-            [_chunk(tool_calls=[_tc("dangerous", {"x": 1})])],
+            [_chunk(tool_calls=[_tc("dangerous", {"x": 1})], eval_count=0, eval_duration=0)],
             [_chunk(content="done", eval_count=1, eval_duration=1_000_000_000)],
         ]
     )
@@ -354,7 +380,7 @@ async def test_approval_approved_runs_tool(monkeypatch):
     final, _ = await run_turn(
         conversation_id="c1",
         base_messages=[],
-        client=client,
+        provider=provider,
         on_event=EventLog(),
         request_approval=_allow,
     )
@@ -375,15 +401,11 @@ async def test_approval_denied_returns_user_denied_without_running(monkeypatch):
 
     monkeypatch.setattr(
         "backend.app.agent.loop.TOOLS",
-        {
-            "dangerous": Tool(
-                name="dangerous", fn=dangerous, schema={}, requires_approval=True
-            )
-        },
+        {"dangerous": _stub_tool("dangerous", dangerous, requires_approval=True)},
     )
-    client = FakeClient(
+    provider = FakeProvider(
         [
-            [_chunk(tool_calls=[_tc("dangerous", {"x": 1})])],
+            [_chunk(tool_calls=[_tc("dangerous", {"x": 1})], eval_count=0, eval_duration=0)],
             [
                 _chunk(
                     content="ok, won't bother",
@@ -398,7 +420,7 @@ async def test_approval_denied_returns_user_denied_without_running(monkeypatch):
     final, _ = await run_turn(
         conversation_id="c1",
         base_messages=[],
-        client=client,
+        provider=provider,
         on_event=events,
         request_approval=_deny,
     )
@@ -422,17 +444,17 @@ async def test_repeated_tool_failure_raises_agent_error(monkeypatch):
 
     monkeypatch.setattr(
         "backend.app.agent.loop.TOOLS",
-        {"boom": Tool(name="boom", fn=boom, schema={}, requires_approval=False)},
+        {"boom": _stub_tool("boom", boom)},
     )
-    client = FakeClient(
-        [[_chunk(tool_calls=[_tc("boom", {})])] for _ in range(3)]
+    provider = FakeProvider(
+        [[_chunk(tool_calls=[_tc("boom", {})], eval_count=0, eval_duration=0)] for _ in range(3)]
     )
 
     with pytest.raises(AgentError, match="3 times in a row"):
         await run_turn(
             conversation_id="c1",
             base_messages=[],
-            client=client,
+            provider=provider,
             on_event=EventLog(),
             request_approval=_allow,
         )
@@ -456,19 +478,19 @@ async def test_consecutive_error_counter_resets_on_different_tool(monkeypatch):
     monkeypatch.setattr(
         "backend.app.agent.loop.TOOLS",
         {
-            "a": Tool(name="a", fn=a, schema={}, requires_approval=False),
-            "b": Tool(name="b", fn=b, schema={}, requires_approval=False),
+            "a": _stub_tool("a", a),
+            "b": _stub_tool("b", b),
         },
     )
-    client = FakeClient(
+    provider = FakeProvider(
         [
-            [_chunk(tool_calls=[_tc("a", {})])],
-            [_chunk(tool_calls=[_tc("a", {})])],
-            [_chunk(tool_calls=[_tc("b", {})])],
-            [_chunk(tool_calls=[_tc("b", {})])],
-            [_chunk(tool_calls=[_tc("a", {})])],
-            [_chunk(tool_calls=[_tc("a", {})])],
-            [_chunk(tool_calls=[_tc("a", {})])],
+            [_chunk(tool_calls=[_tc("a", {})], eval_count=0, eval_duration=0)],
+            [_chunk(tool_calls=[_tc("a", {})], eval_count=0, eval_duration=0)],
+            [_chunk(tool_calls=[_tc("b", {})], eval_count=0, eval_duration=0)],
+            [_chunk(tool_calls=[_tc("b", {})], eval_count=0, eval_duration=0)],
+            [_chunk(tool_calls=[_tc("a", {})], eval_count=0, eval_duration=0)],
+            [_chunk(tool_calls=[_tc("a", {})], eval_count=0, eval_duration=0)],
+            [_chunk(tool_calls=[_tc("a", {})], eval_count=0, eval_duration=0)],
         ]
     )
 
@@ -476,7 +498,7 @@ async def test_consecutive_error_counter_resets_on_different_tool(monkeypatch):
         await run_turn(
             conversation_id="c1",
             base_messages=[],
-            client=client,
+            provider=provider,
             on_event=EventLog(),
             request_approval=_allow,
         )
@@ -493,17 +515,13 @@ async def test_max_steps_exceeded_raises(monkeypatch):
 
     monkeypatch.setattr(
         "backend.app.agent.loop.TOOLS",
-        {
-            "loop": Tool(
-                name="loop", fn=keep_going, schema={}, requires_approval=False
-            )
-        },
+        {"loop": _stub_tool("loop", keep_going)},
     )
     # 2 steps allowed; both produce tool_calls so the loop exits via raise.
-    client = FakeClient(
+    provider = FakeProvider(
         [
-            [_chunk(tool_calls=[_tc("loop", {})])],
-            [_chunk(tool_calls=[_tc("loop", {})])],
+            [_chunk(tool_calls=[_tc("loop", {})], eval_count=0, eval_duration=0)],
+            [_chunk(tool_calls=[_tc("loop", {})], eval_count=0, eval_duration=0)],
         ]
     )
 
@@ -511,7 +529,7 @@ async def test_max_steps_exceeded_raises(monkeypatch):
         await run_turn(
             conversation_id="c1",
             base_messages=[],
-            client=client,
+            provider=provider,
             on_event=EventLog(),
             request_approval=_allow,
         )

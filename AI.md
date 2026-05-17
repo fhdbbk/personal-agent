@@ -11,6 +11,7 @@ This is a **learning project**. Where reinventing has educational value (agent l
 Source of truth for the high-level design: [Project-Idea.md](Project-Idea.md). Phased roadmap and architecture: see ADRs under [docs/decisions/](docs/decisions/).
 
 ## Picking up where we left off
+**Start new development in a separate branch based on the feature or modification in the existing code**. Merge it in main after everything is verified to be working fine. Delete the new branch after merging.
 
 **At the start of every session, read the most recent file in [docs/sessions/](docs/sessions/) before doing anything else.** Its "Open threads / next session" section is the canonical handoff — it tells you what the previous session finished, what's blocked, and what to start next. Don't infer next steps from CLAUDE.md alone; the session log is more current.
 
@@ -34,6 +35,7 @@ Source of truth for the high-level design: [Project-Idea.md](Project-Idea.md). P
 | Streaming + tools | Stream every iteration; tool_calls finalize on the last chunk | [0004](docs/decisions/0004-streaming-with-tools.md) |
 | `web_search` backend | `ddgs` library (browser-fingerprinted DDG) — raw HTML scrape was bot-blocked | [0005](docs/decisions/0005-search-backend-ddgs.md) |
 | `fetch_url` tool | `primp` (reused from ddgs) + `trafilatura` extractor; approval-gated; public hosts only | [0006](docs/decisions/0006-fetch-url-tool.md) |
+| LLM provider abstraction | Hand-rolled `LLMProvider` Protocol + adapters for Ollama (default), Anthropic, OpenAI | [0007](docs/decisions/0007-llm-provider-abstraction.md) |
 | Package manager | uv | [0001](docs/decisions/0001-tech-stack.md) |
 | Python | 3.12 | [0001](docs/decisions/0001-tech-stack.md) |
 
@@ -81,9 +83,14 @@ personal_assistant/
 │       ├── api/chat.py         # POST /chat, POST /chat/reset, WS /chat/stream
 │       ├── agent/
 │       │   ├── prompt.py       # loads SOUL.md as the system prompt
-│       │   └── loop.py         # Phase 2 ReAct loop (ADR 0003)
+│       │   └── loop.py         # Phase 2 ReAct loop (ADR 0003) — provider-agnostic
+│       ├── llm/                # LLM provider abstraction (ADR 0007)
+│       │   ├── base.py         # LLMProvider Protocol + normalized types
+│       │   ├── ollama.py       # OllamaProvider — local default
+│       │   ├── anthropic.py    # AnthropicProvider — Messages API
+│       │   └── openai.py       # OpenAIProvider — Chat Completions API
 │       ├── tools/
-│       │   ├── registry.py     # Tool dataclass + TOOLS dict + ollama specs
+│       │   ├── registry.py     # Tool dataclass + TOOLS dict + 3 provider formatters
 │       │   ├── _sandbox.py     # safe_path / sandbox_root for file tools
 │       │   ├── list_files.py   # list_files tool — sandbox dir listing
 │       │   ├── read_file.py    # read_file tool + JSON schema
@@ -93,14 +100,18 @@ personal_assistant/
 │       ├── memory/buffer.py    # in-process conversation ring buffer
 │       ├── main.py             # FastAPI entry, /health, router mount, CORS
 │       └── config.py           # pydantic-settings, PA_* env vars
-│   └── tests/                  # pytest suite (unit tests, no live Ollama)
-│       └── test_agent_loop.py  # run_turn behaviour: stats, tools, approval, retries, max-steps
+│   └── tests/                  # pytest suite (unit tests, no live LLM)
+│       ├── test_agent_loop.py  # run_turn behaviour: stats, tools, approval, retries, max-steps
+│       ├── test_provider_ollama.py    # OllamaProvider chunk translation
+│       ├── test_provider_anthropic.py # AnthropicProvider message/event translation
+│       └── test_provider_openai.py    # OpenAIProvider chunk translation
 ├── frontend/                   # Vite + React + TS chat UI
 │   ├── src/App.tsx             # chat + tool transcript + approval buttons
 │   └── vite.config.ts          # dev proxy: /chat (ws) and /health → :8000
 ├── sandbox/                    # gitignored; agent's read/write scope
 ├── scripts/
 │   ├── smoke_ollama.py         # verify Ollama reachable + model can complete
+│   ├── smoke_provider.py       # provider-agnostic LLM ping (ollama / anthropic / openai)
 │   ├── smoke_chat_ws.py        # direct WS streaming smoke test
 │   ├── smoke_chat_ws_proxy.py  # WS streaming via Vite dev proxy
 │   ├── smoke_agent.py          # drive the agent loop through tool calls + approval
@@ -141,6 +152,9 @@ curl http://127.0.0.1:8000/health
 # Smoke-test Ollama against the configured model
 uv run python scripts/smoke_ollama.py
 
+# Smoke-test whichever LLM provider is currently configured (PA_LLM_PROVIDER)
+uv run python scripts/smoke_provider.py
+
 # Smoke-test the chat WebSocket (direct + via Vite proxy)
 uv run python scripts/smoke_chat_ws.py
 uv run python scripts/smoke_chat_ws_proxy.py
@@ -170,12 +184,27 @@ uv add <package>
 
 All runtime config goes through [backend/app/config.py](backend/app/config.py) (pydantic-settings, `PA_*` env vars). Currently:
 
+LLM backend selection (ADR 0007):
+- `PA_LLM_PROVIDER` (default `ollama`; one of `ollama` / `anthropic` / `openai`)
+
+Ollama (read only when `PA_LLM_PROVIDER=ollama`):
 - `PA_OLLAMA_HOST` (default `http://localhost:11434`)
 - `PA_OLLAMA_MODEL` (default `qwen3.5:4b`)
 - `PA_OLLAMA_THINK` (default `false` — Qwen3 thinks-before-answering when on; off keeps replies snappy)
 - `PA_OLLAMA_DEVICE` (default `auto`; `cpu` forces `num_gpu=0`, `gpu` forces full offload)
 - `PA_OLLAMA_NUM_CTX` (default `32768` — Ollama itself defaults to 4096, which is too small once tool results enter the conversation; 32k is qwen2.5/3's native training window. Bump to 65536 if you have the VRAM and accept YaRN-extension quality risk past 32k.)
 - `PA_REQUEST_TIMEOUT_S` (default `60`)
+
+Anthropic (read only when `PA_LLM_PROVIDER=anthropic`):
+- `PA_ANTHROPIC_API_KEY` (required)
+- `PA_ANTHROPIC_MODEL` (default `claude-haiku-4-5`)
+- `PA_ANTHROPIC_MAX_TOKENS` (default `4096` — the Messages API requires it)
+
+OpenAI (read only when `PA_LLM_PROVIDER=openai`):
+- `PA_OPENAI_API_KEY` (required)
+- `PA_OPENAI_MODEL` (default `gpt-4o-mini`)
+
+Agent loop + logging:
 - `PA_AGENT_SANDBOX` (default `sandbox` — root for `read_file` / `write_file`)
 - `PA_AGENT_MAX_STEPS` (default `8` — abort the loop after this many model turns)
 - `PA_AGENT_MAX_RETRIES_PER_TOOL` (default `2` — consecutive errors before failing the turn)

@@ -1,22 +1,18 @@
 """Tool registry. Per ADR 0003 §3, this is a dict — not a framework.
 
-Adding a tool is a one-line entry in `TOOLS`. The `Tool` dataclass holds
-the callable, the JSON schema we hand to Ollama, and the approval flag.
+Adding a tool is a one-line entry in `TOOLS`. Each tool exposes its name,
+description, and JSON-Schema parameters; the per-provider formatters here
+wrap that canonical shape into whatever the target LLM expects.
 """
 
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
-from backend.app.tools.fetch_url import SCHEMA as FETCH_URL_SCHEMA
-from backend.app.tools.fetch_url import fetch_url
-from backend.app.tools.list_files import SCHEMA as LIST_FILES_SCHEMA
-from backend.app.tools.list_files import list_files
-from backend.app.tools.read_file import SCHEMA as READ_FILE_SCHEMA
-from backend.app.tools.read_file import read_file
-from backend.app.tools.web_search import SCHEMA as WEB_SEARCH_SCHEMA
-from backend.app.tools.web_search import web_search
-from backend.app.tools.write_file import SCHEMA as WRITE_FILE_SCHEMA
-from backend.app.tools.write_file import write_file
+from backend.app.tools import fetch_url as fetch_url_mod
+from backend.app.tools import list_files as list_files_mod
+from backend.app.tools import read_file as read_file_mod
+from backend.app.tools import web_search as web_search_mod
+from backend.app.tools import write_file as write_file_mod
 
 
 class ToolError(Exception):
@@ -27,45 +23,68 @@ class ToolError(Exception):
 @dataclass(frozen=True)
 class Tool:
     name: str
+    description: str
+    parameters: dict  # inner JSON Schema for the tool's arguments
     fn: Callable[..., Awaitable[str]]
-    schema: dict
     requires_approval: bool
 
 
+def _make(mod, fn, requires_approval: bool) -> Tool:
+    return Tool(
+        name=mod.NAME,
+        description=mod.DESCRIPTION,
+        parameters=mod.PARAMETERS,
+        fn=fn,
+        requires_approval=requires_approval,
+    )
+
+
 TOOLS: dict[str, Tool] = {
-    "list_files": Tool(
-        name="list_files",
-        fn=list_files,
-        schema=LIST_FILES_SCHEMA,
-        requires_approval=False,
-    ),
-    "read_file": Tool(
-        name="read_file",
-        fn=read_file,
-        schema=READ_FILE_SCHEMA,
-        requires_approval=False,
-    ),
-    "write_file": Tool(
-        name="write_file",
-        fn=write_file,
-        schema=WRITE_FILE_SCHEMA,
-        requires_approval=True,
-    ),
-    "web_search": Tool(
-        name="web_search",
-        fn=web_search,
-        schema=WEB_SEARCH_SCHEMA,
-        requires_approval=False,
-    ),
-    "fetch_url": Tool(
-        name="fetch_url",
-        fn=fetch_url,
-        schema=FETCH_URL_SCHEMA,
-        requires_approval=True,
-    ),
+    "list_files": _make(list_files_mod, list_files_mod.list_files, False),
+    "read_file": _make(read_file_mod, read_file_mod.read_file, False),
+    "write_file": _make(write_file_mod, write_file_mod.write_file, True),
+    "web_search": _make(web_search_mod, web_search_mod.web_search, False),
+    "fetch_url": _make(fetch_url_mod, fetch_url_mod.fetch_url, True),
 }
 
 
-def ollama_tool_specs() -> list[dict]:
-    """The list of schemas to pass to `ollama.chat(tools=...)`."""
-    return [t.schema for t in TOOLS.values()]
+def all_tools() -> list[Tool]:
+    return list(TOOLS.values())
+
+
+# ---- per-provider formatters ---------------------------------------
+#
+# Ollama and OpenAI share the same "function" tool envelope; Anthropic
+# uses a flatter shape with `input_schema` instead of `parameters`.
+
+
+def ollama_tool_specs(tools: list[Tool]) -> list[dict]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.parameters,
+            },
+        }
+        for t in tools
+    ]
+
+
+def openai_tool_specs(tools: list[Tool]) -> list[dict]:
+    # Wire-identical to Ollama's; kept as a separate function so the
+    # provider call sites read clearly and the shapes can drift later
+    # if either side changes.
+    return ollama_tool_specs(tools)
+
+
+def anthropic_tool_specs(tools: list[Tool]) -> list[dict]:
+    return [
+        {
+            "name": t.name,
+            "description": t.description,
+            "input_schema": t.parameters,
+        }
+        for t in tools
+    ]
