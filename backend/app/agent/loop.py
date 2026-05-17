@@ -157,10 +157,11 @@ async def run_turn(
         if not tool_calls:
             ttft = (t_first_token - t_start) if t_first_token is not None else None
             log.info(
-                "agent cid=%s done step=%d reply_len=%d eval_tokens=%d eval_s=%.2f ttft_s=%s",
+                "agent cid=%s done step=%d reply_len=%d prompt_tokens=%d eval_tokens=%d eval_s=%.2f ttft_s=%s",
                 conversation_id,
                 step,
                 len(content),
+                total_prompt_tokens,
                 total_eval_tokens,
                 total_eval_ns / 1e9,
                 f"{ttft:.2f}" if ttft is not None else "-",
